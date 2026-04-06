@@ -23,6 +23,7 @@ def _new_browser():
         headless=True,
         enable_cache=True,
         block_images=True,
+        i_know_what_im_doing=True,
         os=["windows"],
         windowsize=(1920, 1080)
     )
