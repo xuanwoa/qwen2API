@@ -20,12 +20,14 @@ async def garbage_collect_chats(client: QwenClient):
             try:
                 # 获取会话列表
                 res = await client.engine.api_call("GET", "/api/v2/chats?limit=50", acc.token)
-                if res.get("status") == 200:
+                if isinstance(res, dict) and res.get("status") == 200:
                     data = json.loads(res.get("body", "{}"))
-                    chats = data.get("data", [])
-                    for c in chats:
-                        if c.get("title", "").startswith("api_"):
-                            # 异步焚烧
-                            asyncio.create_task(client.delete_chat(acc.token, c["id"]))
+                    if isinstance(data, dict):
+                        chats = data.get("data", [])
+                        if isinstance(chats, list):
+                            for c in chats:
+                                if isinstance(c, dict) and c.get("title", "").startswith("api_"):
+                                    # 异步焚烧
+                                    asyncio.create_task(client.delete_chat(acc.token, c["id"]))
             except Exception as e:
                 log.warning(f"[GC] 账号 {acc.email} 焚烧失败: {e}")
