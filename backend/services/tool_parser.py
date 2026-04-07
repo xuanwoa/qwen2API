@@ -68,7 +68,7 @@ def parse_tool_calls(answer: str, tools: list):
             name = best or next(iter(tool_names))
         tool_id = f"toolu_{uuid.uuid4().hex[:8]}"
         blocks = []
-        if prefix:
+        if prefix and prefix.strip():
             blocks.append({"type": "text", "text": prefix})
         blocks.append({"type": "tool_use", "id": tool_id, "name": name, "input": input_data})
         return blocks, "tool_use"
@@ -181,12 +181,19 @@ def parse_tool_calls(answer: str, tools: list):
     # 5. 极端保底拦截：只要看到文本中含有明显意图，但正则全部失败，强制触发纠偏
     # 例如 Qwen 输出: "我将使用 Tool Read 来读取..." 或者 "Tool Glob does not exist"
     if answer.strip() and tools:
-        for tn in tool_names:
-            if tn.lower() in answer.lower() or "tool" in answer.lower():
-                log.warning(f"[ToolParse] 未匹配到正确格式，但检测到工具调用意图。强制阻断纯文本返回。")
-                # 构造一个错误输入，强迫 Claude Code 回抛错误让模型重试
+        lower_ans = answer.lower()
+        if "tool" in lower_ans or "✿action✿" in lower_ans or "action" in lower_ans:
+            log.warning(f"[ToolParse] 未匹配到正确格式，但检测到工具调用意图。强制阻断纯文本返回。")
+            # 尝试在文本中寻找被提及的工具名
+            fallback_name = None
+            for tn in tool_names:
+                if tn.lower() in lower_ans:
+                    fallback_name = tn
+                    break
+            if not fallback_name:
                 fallback_name = next(iter(tool_names)) if tool_names else "unknown"
-                return _make_tool_block(fallback_name, {"_error": "You MUST use ✿ACTION✿ syntax to call tools. Direct text or JSON is invalid. PLEASE RETRY."})
+            
+            return _make_tool_block(fallback_name, {"_error": "You MUST use ✿ACTION✿ syntax to call tools. Direct text or JSON is invalid. PLEASE RETRY."})
 
     log.warning(f"[ToolParse] ✗ 未检测到工具调用，作为普通文本返回。工具列表: {tool_names}")
     
