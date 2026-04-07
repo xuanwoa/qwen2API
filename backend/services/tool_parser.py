@@ -211,10 +211,15 @@ def parse_tool_calls(answer: str, tools: list):
     text_content = answer if answer.strip() else "[模型思考完毕，但未能按照要求输出✿ACTION✿工具调用。请重新调整提示词。]"
     
     # 既然模型死活不调用，又没法报错给用户，就强制触发一个空操作的AskUserQuestion或者抛错，让工作流中断
-    if not answer.strip() and "AskUserQuestion" in tool_names:
-        log.warning("[ToolParse] 强制使用 AskUserQuestion 以阻断空循环。")
-        return _make_tool_block("AskUserQuestion", {"questions": [{"question": "系统：大模型连续5次拒绝输出任何内容，可能已触发内置安全限制或死循环。请尝试修改你的指令或放弃当前任务。", "options": [{"label": "好的", "description": "知道了"}], "header": "模型异常", "multiSelect": False}]})
-    
+    if not answer.strip():
+        if "AskUserQuestion" in tool_names:
+            log.warning("[ToolParse] 强制使用 AskUserQuestion 以阻断空循环。")
+            return _make_tool_block("AskUserQuestion", {"questions": [{"question": "系统：大模型连续5次拒绝输出任何内容，可能已触发内置安全限制或死循环。建议：1. 简化你的报错日志；2. 直接告诉模型“修改文件代码”，不要让它分析。", "options": [{"label": "好的，我重试", "description": "明白了"}], "header": "模型装死拦截", "multiSelect": False}]})
+        elif "Edit" in tool_names:
+            return _make_tool_block("Edit", {"path": "/workspace/README.md", "command": "view", "start_line": 1, "end_line": 10})
+        elif "Read" in tool_names:
+            return _make_tool_block("Read", {"file_path": "/workspace/README.md"})
+            
     return [{"type": "text", "text": text_content}], "end_turn"
 
 def inject_format_reminder(prompt: str, tool_name: str) -> str:
