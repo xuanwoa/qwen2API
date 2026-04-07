@@ -42,14 +42,16 @@ async (args) => {
         }
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
-        let body = '';
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            body += decoder.decode(value, { stream: true });
+            const chunk = decoder.decode(value, { stream: true });
+            if (window.send_chunk) {
+                await window.send_chunk(args.chat_id, chunk);
+            }
         }
         clearTimeout(timer);
-        return { status: res.status, body: body };
+        return { status: res.status, body: "streamed" };
     } catch(e) {
         clearTimeout(timer);
         return { status: 0, body: 'JS error: ' + e.message };
@@ -109,8 +111,19 @@ class BrowserEngine:
 
     async def _init_pages(self):
         log.info(f"[Browser] 正在初始化 {self.pool_size} 个并发渲染引擎页面...")
+        self.stream_queues = {}  # chat_id -> asyncio.Queue()
+
+        async def handle_chunk(chat_id, chunk):
+            if chat_id in self.stream_queues:
+                self.stream_queues[chat_id].put_nowait(chunk)
+
         for i in range(self.pool_size):
             page = await self._browser.new_page()
+            try:
+                await page.expose_function("send_chunk", handle_chunk)
+            except Exception as e:
+                log.error(f"[Browser] expose_function failed: {e}")
+
             try:
                 await page.goto(self.base_url, wait_until="domcontentloaded", timeout=60000)
             except Exception:
@@ -190,36 +203,54 @@ class BrowserEngine:
             else:
                 self._pages.put_nowait(page)
 
-    async def fetch_chat(self, token: str, chat_id: str, payload: dict) -> dict:
+    async def fetch_chat(self, token: str, chat_id: str, payload: dict):
         await asyncio.wait_for(self._ready.wait(), timeout=300)
         if not self._started:
-            return {"status": 0, "body": "Browser engine failed to start"}
-        
+            yield {"status": 0, "body": "Browser engine failed to start"}
+            return
+
         try:
-            # 等待可用浏览器页面的防洪缓冲
             page = await asyncio.wait_for(self._pages.get(), timeout=60)
         except asyncio.TimeoutError:
             log.warning("[Browser] Fetch chat queue timeout (60s) — No available pages.")
-            return {"status": 429, "body": "Too Many Requests (Queue full)"}
+            yield {"status": 429, "body": "Too Many Requests (Queue full)"}
+            return
+
+        queue = asyncio.Queue()
+        self.stream_queues[chat_id] = queue
 
         needs_refresh = False
+        url = f'/api/v2/chat/completions?chat_id={chat_id}'
+
+        async def _run_eval():
+            try:
+                res = await asyncio.wait_for(
+                    page.evaluate(JS_STREAM_FULL, {"url": url, "token": token, "payload": payload, "chat_id": chat_id}),
+                    timeout=180,
+                )
+                queue.put_nowait({"type": "end", "result": res})
+            except asyncio.TimeoutError:
+                queue.put_nowait({"type": "end", "result": {"status": 0, "body": "Timeout"}})
+            except Exception as e:
+                queue.put_nowait({"type": "end", "result": {"status": 0, "body": str(e)}})
+
+        task = asyncio.create_task(_run_eval())
+
         try:
-            url = f'/api/v2/chat/completions?chat_id={chat_id}'
-            result = await asyncio.wait_for(
-                page.evaluate(JS_STREAM_FULL, {"url": url, "token": token, "payload": payload}),
-                timeout=180,
-            )
-            if result.get("status") == 0:
-                log.warning(f"[Browser] JS Error: {result.get('body','')[:100]}")
-                needs_refresh = True
-            return result
-        except asyncio.TimeoutError:
-            needs_refresh = True
-            return {"status": 0, "body": "Timeout"}
-        except Exception as e:
-            needs_refresh = True
-            return {"status": 0, "body": str(e)}
+            while True:
+                item = await queue.get()
+                if isinstance(item, str):
+                    yield {"status": 200, "chunk": item}
+                elif isinstance(item, dict) and item.get("type") == "end":
+                    res = item["result"]
+                    if res.get("status") != 200 and res.get("status") != "streamed":
+                        log.warning(f"[Browser] JS Error/Non-200: {res.get('body','')[:100]}")
+                        needs_refresh = True
+                        yield res
+                    break
         finally:
+            if chat_id in self.stream_queues:
+                del self.stream_queues[chat_id]
             if needs_refresh:
                 asyncio.create_task(self._refresh_page_and_return(page))
             else:

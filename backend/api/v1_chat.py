@@ -59,38 +59,60 @@ async def chat_completions(request: Request):
     # 无感重试调用
     async def generate():
         current_prompt = content
-        
+
         for stream_attempt in range(5):
             try:
-                events, chat_id, acc = await client.chat_stream_events_with_retry(model, current_prompt)
+                chat_id = None
+                acc = None
                 
-                # Buffer all events
-                thinking_chunks = []
+                # Start stream
+                completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+
                 answer_chunks = []
                 native_tc_chunks = {}
-                for evt in events:
-                    if evt.get("type") != "delta":
+                
+                async for item in client.chat_stream_events_with_retry(model, current_prompt):
+                    if item["type"] == "meta":
+                        chat_id = item["chat_id"]
+                        acc = item["acc"]
                         continue
-                    phase = evt.get("phase", "")
-                    cont = evt.get("content", "")
-                    if phase in ("think", "thinking_summary") and cont:
-                        thinking_chunks.append(cont)
-                    elif phase == "answer" and cont:
-                        answer_chunks.append(cont)
-                    elif phase == "tool_call" and cont:
-                        tc_id = evt.get("extra", {}).get("tool_call_id", "tc_0")
-                        if tc_id not in native_tc_chunks:
-                            native_tc_chunks[tc_id] = {"name": "", "args": ""}
-                        try:
-                            chunk = json.loads(cont)
-                            if "name" in chunk:
-                                native_tc_chunks[tc_id]["name"] = chunk["name"]
-                            if "arguments" in chunk:
-                                native_tc_chunks[tc_id]["args"] += chunk["arguments"]
-                        except (json.JSONDecodeError, ValueError):
-                            native_tc_chunks[tc_id]["args"] += cont
-                    if evt.get("status") == "finished" and phase == "answer":
-                        break
+                    
+                    if item["type"] == "event":
+                        evt = item["event"]
+                        if evt.get("type") != "delta":
+                            continue
+                        
+                        phase = evt.get("phase", "")
+                        cont = evt.get("content", "")
+                        
+                        if phase in ("think", "thinking_summary") and cont:
+                            # Stream reasoning immediately
+                            chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"content": cont}, "finish_reason": None}]
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                            
+                        elif phase == "answer" and cont:
+                            answer_chunks.append(cont)
+                            # For answer, we buffer it to parse tools at the end
+                            # If we wanted full text streaming, we could stream it here, but we need to intercept ✿ACTION✿
+                            
+                        elif phase == "tool_call" and cont:
+                            tc_id = evt.get("extra", {}).get("tool_call_id", "tc_0")
+                            if tc_id not in native_tc_chunks:
+                                native_tc_chunks[tc_id] = {"name": "", "args": ""}
+                            try:
+                                chunk_json = json.loads(cont)
+                                if "name" in chunk_json:
+                                    native_tc_chunks[tc_id]["name"] = chunk_json["name"]
+                                if "arguments" in chunk_json:
+                                    native_tc_chunks[tc_id]["args"] += chunk_json["arguments"]
+                            except (json.JSONDecodeError, ValueError):
+                                native_tc_chunks[tc_id]["args"] += cont
 
                 answer_text = "".join(answer_chunks)
                 
@@ -103,7 +125,6 @@ async def chat_completions(request: Request):
                             inp = json.loads(tc["args"]) if tc["args"] else {}
                         except (json.JSONDecodeError, ValueError):
                             inp = {"raw": tc["args"]}
-                        # 将原生调用转化为自定义的 ✿ACTION✿ 语法交由统一解析器处理
                         tc_parts.append(f'✿ACTION✿\n{{"action": {json.dumps(name)}, "args": {json.dumps(inp, ensure_ascii=False)}}}\n✿END_ACTION✿')
                     
                     if not answer_text:
@@ -111,22 +132,6 @@ async def chat_completions(request: Request):
                     else:
                         answer_text += "\n\n" + "\n\n".join(tc_parts)
 
-                reasoning_text = "".join(thinking_chunks)
-                
-                # Detect Qwen native tool call interception
-                import re
-                native_blocked_m = re.search(r'Tool (\w+) does not exists?\.?', answer_text.strip(), re.IGNORECASE)
-                if native_blocked_m and tools and stream_attempt < 4:
-                    blocked_name = native_blocked_m.group(1)
-                    client.account_pool.release(acc)
-                    import asyncio
-                    asyncio.create_task(client.delete_chat(acc.token, chat_id))
-                    log.warning(f"[NativeBlock-OAI] Qwen拦截原生工具调用 '{blocked_name}'，重试 (attempt {stream_attempt+1}/5)")
-                    from backend.services.tool_parser import inject_format_reminder
-                    current_prompt = inject_format_reminder(current_prompt, blocked_name)
-                    await asyncio.sleep(0.5)
-                    continue
-                    
                 # Parse tools
                 from backend.services.tool_parser import parse_tool_calls
                 if tools:
@@ -134,30 +139,14 @@ async def chat_completions(request: Request):
                 else:
                     blocks = [{"type": "text", "text": answer_text}]
                     stop_reason = "stop"
-                    
+
                 if stop_reason == "end_turn":
                     stop_reason = "stop"
-                    
-                completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-                
-                # 修复 OpenAI 流式规范：严格按照 role -> tool_calls(name) -> tool_calls(args) -> finish 的顺序吐出 chunk
-                # Role chunk
-                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
 
                 has_tool_call = stop_reason == "tool_use" or stop_reason == "tool_calls"
-                
-                if has_tool_call:
-                    # 如果有思考过程，先作为 content 吐出，让用户能看到
-                    if reasoning_text:
-                        chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "model": model,
-                            "choices": [{"index": 0, "delta": {"content": reasoning_text}, "finish_reason": None}]
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
 
-                    # 再吐出前置文本（如果有）
+                if has_tool_call:
+                    # 前置文本如果有，吐出
                     txt_list = [b for b in blocks if b["type"] == "text" and b.get("text")]
                     for blk in txt_list:
                         chunk = {
@@ -168,10 +157,9 @@ async def chat_completions(request: Request):
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
 
-                    # 最后吐出 tool_calls
+                    # 吐出 tool_calls
                     tc_list = [b for b in blocks if b["type"] == "tool_use"]
                     for idx, tc in enumerate(tc_list):
-                        # 1. 吐出函数名
                         tc_name_chunk = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -186,8 +174,7 @@ async def chat_completions(request: Request):
                             }, "finish_reason": None}]
                         }
                         yield f"data: {json.dumps(tc_name_chunk)}\n\n"
-                        
-                        # 2. 吐出参数
+
                         tc_args_chunk = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -200,20 +187,10 @@ async def chat_completions(request: Request):
                             }, "finish_reason": None}]
                         }
                         yield f"data: {json.dumps(tc_args_chunk)}\n\n"
-                    
+
                     stop_reason = "tool_calls"
                 else:
-                    # Thinking blocks
-                    if reasoning_text:
-                        chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "model": model,
-                            "choices": [{"index": 0, "delta": {"content": reasoning_text}, "finish_reason": None}]
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                    
-                    # Normal text blocks
+                    # 纯文本（非 tool_call），直接吐出
                     txt_list = [b for b in blocks if b["type"] == "text" and b.get("text")]
                     for blk in txt_list:
                         chunk = {
@@ -224,7 +201,6 @@ async def chat_completions(request: Request):
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
 
-                # Final chunk
                 final_chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -233,21 +209,23 @@ async def chat_completions(request: Request):
                 }
                 yield f"data: {json.dumps(final_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
-                
+
                 log.info(f"[OAI] Request complete. Generated {len(answer_text)} characters.")
-                
+
                 users = await users_db.get()
                 for u in users:
                     if u["id"] == token:
                         u["used_tokens"] += len(answer_text) + len(current_prompt)
                         break
                 await users_db.save(users)
-                
-                client.account_pool.release(acc)
-                import asyncio
-                asyncio.create_task(client.delete_chat(acc.token, chat_id))
+
+                if acc:
+                    client.account_pool.release(acc)
+                    if chat_id:
+                        import asyncio
+                        asyncio.create_task(client.delete_chat(acc.token, chat_id))
                 return
-                
+
             except Exception as e:
                 log.error(f"Chat request failed: {e}")
                 return

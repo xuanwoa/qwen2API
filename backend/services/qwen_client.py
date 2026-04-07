@@ -147,38 +147,35 @@ class QwenClient:
             "timestamp": ts,
         }
 
-    def parse_sse_body(self, body: str) -> list[dict]:
+    def parse_sse_chunk(self, chunk: str) -> list[dict]:
         events = []
-        for line in body.split("\n"):
+        for line in chunk.splitlines():
             line = line.strip()
             if not line.startswith("data:"):
                 continue
-            raw = line[5:].strip()
-            if raw == "[DONE]":
-                events.append({"type": "done"})
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
                 continue
             try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
+                obj = json.loads(data)
+                events.append(obj)
+            except Exception:
                 continue
-                
-            if "code" in data and "message" in data and "choices" not in data:
-                raise Exception(f"Qwen API error {data.get('code')}: {data.get('message')}")
-                
-            choices = data.get("choices", [])
-            if not choices:
-                continue
-                
-            delta = choices[0].get("delta", {})
-            events.append({
-                "type": "delta",
-                "phase": delta.get("phase", ""),
-                "content": delta.get("content", ""),
-                "status": delta.get("status", "")
-            })
-        return events
+        
+        parsed = []
+        for evt in events:
+            if evt.get("choices"):
+                delta = evt["choices"][0].get("delta", {})
+                parsed.append({
+                    "type": "delta",
+                    "phase": delta.get("phase", "answer"),
+                    "content": delta.get("content", ""),
+                    "status": delta.get("status", ""),
+                    "extra": delta.get("extra", {})
+                })
+        return parsed
 
-    async def chat_stream_events_with_retry(self, model: str, content: str) -> tuple[list[dict], str, Account]:
+    async def chat_stream_events_with_retry(self, model: str, content: str):
         """无感容灾重试逻辑：上游挂了自动换号"""
         exclude = set()
         for attempt in range(settings.MAX_RETRIES):
@@ -189,16 +186,21 @@ class QwenClient:
             try:
                 chat_id = await self.create_chat(acc.token, model)
                 payload = self._build_payload(chat_id, model, content)
-                result = await self.engine.fetch_chat(acc.token, chat_id, payload)
                 
-                if result["status"] == 429:
-                    raise Exception("Engine Queue Full")
+                # First yield the chat_id and account to the consumer
+                yield {"type": "meta", "chat_id": chat_id, "acc": acc}
+
+                async for chunk_result in self.engine.fetch_chat(acc.token, chat_id, payload):
+                    if chunk_result.get("status") == 429:
+                        raise Exception("Engine Queue Full")
+                    if chunk_result.get("status") != 200 and chunk_result.get("status") != "streamed":
+                        raise Exception(f"HTTP {chunk_result['status']}: {chunk_result.get('body', '')[:100]}")
                     
-                if result["status"] != 200:
-                    raise Exception(f"HTTP {result['status']}: {result['body'][:100]}")
-                    
-                events = self.parse_sse_body(result["body"])
-                return events, chat_id, acc
+                    if "chunk" in chunk_result:
+                        events = self.parse_sse_chunk(chunk_result["chunk"])
+                        for evt in events:
+                            yield {"type": "event", "event": evt}
+                return
                 
             except Exception as e:
                 err_msg = str(e).lower()

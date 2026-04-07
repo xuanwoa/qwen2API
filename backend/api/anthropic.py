@@ -74,38 +74,73 @@ async def anthropic_messages(request: Request):
         
     async def generate():
         current_prompt = content
-        
+
         for stream_attempt in range(5): # MAX_RETRIES
             try:
-                events, chat_id, acc = await client.chat_stream_events_with_retry(model, current_prompt)
+                chat_id = None
+                acc = None
                 
-                # Buffer all events
-                thinking_chunks = []
+                msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+                input_usage = len(current_prompt) # simple char len approx or precise
+                
+                yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'usage': {'input_tokens': input_usage, 'output_tokens': 0}}})}\n\n"
+                
                 answer_chunks = []
                 native_tc_chunks = {}
-                for evt in events:
-                    if evt.get("type") != "delta":
+                block_idx = 0
+                in_thinking_block = False
+                
+                async for item in client.chat_stream_events_with_retry(model, current_prompt):
+                    if item["type"] == "meta":
+                        chat_id = item["chat_id"]
+                        acc = item["acc"]
                         continue
-                    phase = evt.get("phase", "")
-                    cont = evt.get("content", "")
-                    if phase in ("think", "thinking_summary") and cont:
-                        thinking_chunks.append(cont)
-                    elif phase == "answer" and cont:
-                        answer_chunks.append(cont)
-                    elif phase == "tool_call" and cont:
-                        tc_id = evt.get("extra", {}).get("tool_call_id", "tc_0")
-                        if tc_id not in native_tc_chunks:
-                            native_tc_chunks[tc_id] = {"name": "", "args": ""}
-                        try:
-                            chunk = json.loads(cont)
-                            if "name" in chunk:
-                                native_tc_chunks[tc_id]["name"] = chunk["name"]
-                            if "arguments" in chunk:
-                                native_tc_chunks[tc_id]["args"] += chunk["arguments"]
-                        except (json.JSONDecodeError, ValueError):
-                            native_tc_chunks[tc_id]["args"] += cont
-                    if evt.get("status") == "finished" and phase == "answer":
-                        break
+                    
+                    if item["type"] == "event":
+                        evt = item["event"]
+                        if evt.get("type") != "delta":
+                            continue
+                        
+                        phase = evt.get("phase", "")
+                        cont = evt.get("content", "")
+                        
+                        if phase in ("think", "thinking_summary") and cont:
+                            if not in_thinking_block:
+                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
+                                in_thinking_block = True
+                            
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'thinking_delta', 'thinking': cont}})}\n\n"
+                            
+                        elif phase == "answer" and cont:
+                            if in_thinking_block:
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n"
+                                in_thinking_block = False
+                                block_idx += 1
+                                
+                            answer_chunks.append(cont)
+                            
+                        elif phase == "tool_call" and cont:
+                            if in_thinking_block:
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n"
+                                in_thinking_block = False
+                                block_idx += 1
+                                
+                            tc_id = evt.get("extra", {}).get("tool_call_id", "tc_0")
+                            if tc_id not in native_tc_chunks:
+                                native_tc_chunks[tc_id] = {"name": "", "args": ""}
+                            try:
+                                chunk_json = json.loads(cont)
+                                if "name" in chunk_json:
+                                    native_tc_chunks[tc_id]["name"] = chunk_json["name"]
+                                if "arguments" in chunk_json:
+                                    native_tc_chunks[tc_id]["args"] += chunk_json["arguments"]
+                            except (json.JSONDecodeError, ValueError):
+                                native_tc_chunks[tc_id]["args"] += cont
+
+                if in_thinking_block:
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n"
+                    in_thinking_block = False
+                    block_idx += 1
 
                 answer_text = "".join(answer_chunks)
 
@@ -118,7 +153,6 @@ async def anthropic_messages(request: Request):
                             inp = json.loads(tc["args"]) if tc["args"] else {}
                         except (json.JSONDecodeError, ValueError):
                             inp = {"raw": tc["args"]}
-                        # 将原生调用转化为自定义的 ✿ACTION✿ 语法交由统一解析器处理
                         tc_parts.append(f'✿ACTION✿\n{{"action": {json.dumps(name)}, "args": {json.dumps(inp, ensure_ascii=False)}}}\n✿END_ACTION✿')
                     
                     if not answer_text:
@@ -126,22 +160,6 @@ async def anthropic_messages(request: Request):
                     else:
                         answer_text += "\n\n" + "\n\n".join(tc_parts)
 
-                reasoning_text = "".join(thinking_chunks)
-                
-                # Detect Qwen native tool call interception
-                import re
-                native_blocked_m = re.search(r'Tool (\w+) does not exists?\.?', answer_text.strip(), re.IGNORECASE)
-                if native_blocked_m and tools and stream_attempt < 4:
-                    blocked_name = native_blocked_m.group(1)
-                    client.account_pool.release(acc)
-                    import asyncio
-                    asyncio.create_task(client.delete_chat(acc.token, chat_id))
-                    log.warning(f"[NativeBlock-ANT] Qwen拦截原生工具调用 '{blocked_name}'，重试 (attempt {stream_attempt+1}/5)")
-                    from backend.services.tool_parser import inject_format_reminder
-                    current_prompt = inject_format_reminder(current_prompt, blocked_name)
-                    await asyncio.sleep(0.5)
-                    continue
-                    
                 # Parse tools
                 from backend.services.tool_parser import parse_tool_calls
                 if tools:
@@ -149,20 +167,6 @@ async def anthropic_messages(request: Request):
                 else:
                     blocks = [{"type": "text", "text": answer_text}]
                     stop_reason = "end_turn"
-                    
-                input_usage = len(current_prompt) # simple char len approx or precise
-                
-                msg_id = f"msg_{uuid.uuid4().hex[:12]}"
-                yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'usage': {'input_tokens': input_usage, 'output_tokens': 0}}})}\n\n"
-
-                block_idx = 0
-
-                # Thinking block
-                if reasoning_text:
-                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
-                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'thinking_delta', 'thinking': reasoning_text}})}\n\n"
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n"
-                    block_idx += 1
 
                 # Text + tool_use blocks
                 for blk in blocks:
@@ -179,19 +183,21 @@ async def anthropic_messages(request: Request):
 
                 yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason}, 'usage': {'output_tokens': len(answer_text)}})}\n\n"
                 yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-                
+
                 users = await users_db.get()
                 for u in users:
                     if u["id"] == token:
                         u["used_tokens"] += len(answer_text) + input_usage
                         break
                 await users_db.save(users)
-                
-                client.account_pool.release(acc)
-                import asyncio
-                asyncio.create_task(client.delete_chat(acc.token, chat_id))
+
+                if acc:
+                    client.account_pool.release(acc)
+                    if chat_id:
+                        import asyncio
+                        asyncio.create_task(client.delete_chat(acc.token, chat_id))
                 return
-                
+
             except Exception as e:
                 log.error(f"Anthropic stream error: {e}")
                 return
