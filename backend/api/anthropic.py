@@ -80,15 +80,15 @@ async def anthropic_messages(request: Request):
     async def generate():
         current_prompt = content
 
+        msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+        input_usage = len(current_prompt) # simple char len approx or precise
+        
+        yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'usage': {'input_tokens': input_usage, 'output_tokens': 0}}})}\n\n"
+
         for stream_attempt in range(5): # MAX_RETRIES
             try:
                 chat_id = None
                 acc = None
-                
-                msg_id = f"msg_{uuid.uuid4().hex[:12]}"
-                input_usage = len(current_prompt) # simple char len approx or precise
-                
-                yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'usage': {'input_tokens': input_usage, 'output_tokens': 0}}})}\n\n"
                 
                 answer_chunks = []
                 thinking_chunks = []
@@ -236,6 +236,7 @@ async def anthropic_messages(request: Request):
 
             except Exception as e:
                 log.error(f"Anthropic stream error: {e}")
+                yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)}})}\n\n"
                 return
 
     return StreamingResponse(generate(), media_type="text/event-stream")
