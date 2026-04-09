@@ -289,9 +289,10 @@ class QwenClient:
                     exclude.add(acc.email)
                     asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
                 else:
-                    acc.status_code = "invalid"
+                    # 泛化/瞬态错误（JS eval 失败、网络抖动等）
+                    # 不排除账号，避免单账号情况下重试无可用账号
                     acc.last_error = str(e)
-                    exclude.add(acc.email)
+                    log.warning(f"[Retry] transient error, will retry with same account pool: {e}")
 
                 if should_save:
                     await self.account_pool.save()
@@ -364,7 +365,12 @@ class QwenClient:
                 elif _is_auth_error(err_msg):
                     self.account_pool.mark_invalid(acc, reason="auth_error", error_message=str(e))
                     asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
-                exclude.add(acc.email)
+                    exclude.add(acc.email)
+                elif _is_banned_error(err_msg):
+                    exclude.add(acc.email)
+                elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
+                    pass  # already handled above, mark_rate_limited excludes implicitly
+                # 泛化错误不排除账号，允许用同一账号重试
                 self.account_pool.release(acc)
                 log.warning(f"[T2I Retry {attempt+1}/{settings.MAX_RETRIES}] Account {acc.email} failed: {e}")
 

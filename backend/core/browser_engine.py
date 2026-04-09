@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -14,7 +15,7 @@ async (args) => {
             'Authorization': 'Bearer ' + args.token
         }
     };
-    if (args.body) opts.body = JSON.stringify(args.body);
+    if (args.body_json) opts.body = args.body_json;
     const res = await fetch(args.url, opts);
     const text = await res.text();
     return { status: res.status, body: text };
@@ -32,7 +33,7 @@ async (args) => {
                 'Content-Type': 'application/json',
                 'Authorization': 'Bearer ' + args.token
             },
-            body: JSON.stringify(args.payload),
+            body: args.payload_json,
             signal: controller.signal
         });
         if (!res.ok) {
@@ -77,7 +78,7 @@ async (args) => {
                 'Content-Type': 'application/json',
                 'Authorization': 'Bearer ' + args.token
             },
-            body: JSON.stringify(args.payload),
+            body: args.payload_json,
             signal: controller.signal
         });
         if (!res.ok) {
@@ -231,7 +232,8 @@ class BrowserEngine:
         needs_refresh = False
         try:
             result = await page.evaluate(JS_FETCH, {
-                "method": method, "url": path, "token": token, "body": body,
+                "method": method, "url": path, "token": token,
+                "body_json": json.dumps(body, ensure_ascii=False) if body else None,
             })
             if result.get("status") == 0 and result.get("body", "").startswith("JS error:"):
                 needs_refresh = True
@@ -266,7 +268,7 @@ class BrowserEngine:
         if buffered:
             try:
                 res = await asyncio.wait_for(
-                    page.evaluate(JS_STREAM_FULL, {"url": url, "token": token, "payload": payload}),
+                    page.evaluate(JS_STREAM_FULL, {"url": url, "token": token, "payload_json": json.dumps(payload, ensure_ascii=False)}),
                     timeout=1800,
                 )
                 if res.get("status") != 200:
@@ -293,7 +295,9 @@ class BrowserEngine:
             # 启动 JS 流式读取（不 await），同时从队列实时 yield 每个 chunk
             js_task = asyncio.create_task(
                 page.evaluate(JS_STREAM_CHUNKED, {
-                    "url": url, "token": token, "payload": payload, "chat_id": chat_id
+                    "url": url, "token": token,
+                    "payload_json": json.dumps(payload, ensure_ascii=False),
+                    "chat_id": chat_id
                 })
             )
             # 从队列实时转发 chunk，直到 JS 任务结束且队列清空
