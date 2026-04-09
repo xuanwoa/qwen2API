@@ -11,6 +11,22 @@ from backend.services.auth_resolver import AuthResolver
 
 log = logging.getLogger("qwen2api.client")
 
+AUTH_FAIL_KEYWORDS = ("token", "unauthorized", "expired", "forbidden", "401", "403", "invalid", "login", "activation", "pending activation", "not activated")
+PENDING_ACTIVATION_KEYWORDS = ("pending activation", "please check your email", "not activated")
+BANNED_KEYWORDS = ("banned", "suspended", "blocked", "disabled", "risk control", "violat", "forbidden by policy")
+
+def _is_auth_error(error_msg: str) -> bool:
+    msg = error_msg.lower()
+    return any(keyword in msg for keyword in AUTH_FAIL_KEYWORDS)
+
+def _is_pending_activation_error(error_msg: str) -> bool:
+    msg = error_msg.lower()
+    return any(keyword in msg for keyword in PENDING_ACTIVATION_KEYWORDS)
+
+def _is_banned_error(error_msg: str) -> bool:
+    msg = error_msg.lower()
+    return any(keyword in msg for keyword in BANNED_KEYWORDS)
+
 class QwenClient:
     def __init__(self, engine: BrowserEngine, account_pool: AccountPool):
         self.engine = engine
@@ -175,13 +191,19 @@ class QwenClient:
                 })
         return parsed
 
-    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = False):
+    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None):
         """无感容灾重试逻辑：上游挂了自动换号"""
-        exclude = set()
+        exclude = set(exclude_accounts or set())
         for attempt in range(settings.MAX_RETRIES):
             acc = await self.account_pool.acquire_wait(timeout=60, exclude=exclude)
             if not acc:
-                raise Exception("No available accounts in pool (all busy or rate limited)")
+                pool_status = self.account_pool.status()
+                raise Exception(
+                    "No available accounts in pool "
+                    f"(total={pool_status['total']}, valid={pool_status['valid']}, "
+                    f"invalid={pool_status['invalid']}, activation_pending={pool_status.get('activation_pending', 0)}, "
+                    f"rate_limited={pool_status['rate_limited']}, in_use={pool_status['in_use']}, waiting={pool_status['waiting']})"
+                )
                 
             try:
                 chat_id = await self.create_chat(acc.token, model)
@@ -215,20 +237,31 @@ class QwenClient:
                 
             except Exception as e:
                 err_msg = str(e).lower()
+                should_save = False
                 if "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
-                    self.account_pool.mark_rate_limited(acc)
+                    self.account_pool.mark_rate_limited(acc, error_message=str(e))
                     exclude.add(acc.email)
-                elif "unauthorized" in err_msg or "401" in err_msg or "403" in err_msg:
-                    self.account_pool.mark_invalid(acc)
+                elif _is_pending_activation_error(err_msg):
+                    self.account_pool.mark_invalid(acc, reason="pending_activation", error_message=str(e))
                     exclude.add(acc.email)
-                    if "activation" in err_msg or "pending" in err_msg:
-                        acc.activation_pending = True
-                    # 触发全量自愈 (包含激活邮件)
+                    acc.activation_pending = True
+                    should_save = True
+                    asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+                elif _is_banned_error(err_msg):
+                    self.account_pool.mark_invalid(acc, reason="banned", error_message=str(e))
+                    exclude.add(acc.email)
+                elif _is_auth_error(err_msg):
+                    self.account_pool.mark_invalid(acc, reason="auth_error", error_message=str(e))
+                    exclude.add(acc.email)
                     asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
                 else:
-                    # 瞬时错误，不标记死号，但排除它并重试下一个
+                    acc.status_code = "invalid"
+                    acc.last_error = str(e)
                     exclude.add(acc.email)
-                
+
+                if should_save:
+                    await self.account_pool.save()
+
                 self.account_pool.release(acc)
                 log.warning(f"[Retry {attempt+1}/{settings.MAX_RETRIES}] Account {acc.email} failed: {e}. Retrying...")
                 

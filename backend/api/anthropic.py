@@ -15,12 +15,57 @@ from backend.core.config import resolve_model, settings
 log = logging.getLogger("qwen2api.anthropic")
 router = APIRouter()
 
+async def _stream_items_with_keepalive(client, model: str, prompt: str, has_custom_tools: bool, exclude_accounts=None):
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _producer():
+        try:
+            async for item in client.chat_stream_events_with_retry(model, prompt, has_custom_tools=has_custom_tools, exclude_accounts=exclude_accounts):
+                await queue.put(("item", item))
+        except Exception as e:
+            await queue.put(("error", e))
+        finally:
+            await queue.put(("done", None))
+
+    producer_task = asyncio.create_task(_producer())
+    try:
+        while True:
+            try:
+                kind, payload = await asyncio.wait_for(queue.get(), timeout=max(1, settings.STREAM_KEEPALIVE_INTERVAL))
+            except asyncio.TimeoutError:
+                yield {"type": "keepalive"}
+                continue
+
+            if kind == "item":
+                yield payload
+            elif kind == "error":
+                raise payload
+            elif kind == "done":
+                break
+    finally:
+        if not producer_task.done():
+            producer_task.cancel()
+            try:
+                await producer_task
+            except asyncio.CancelledError:
+                pass
+
 def _extract_blocked_tool_names(text: str) -> list[str]:
     if not text:
         return []
     return re.findall(r"Tool\s+([A-Za-z0-9_.:-]+)\s+does not exists?\.?", text)
 
-def _recent_same_tool_name_count(messages, tool_name: str) -> int:
+def _tool_identity(tool_name: str, tool_input=None) -> str:
+    try:
+        if tool_name == "Read" and isinstance(tool_input, dict):
+            return f"Read::{tool_input.get('file_path','').strip()}"
+        return f"{tool_name}::{json.dumps(tool_input or {}, ensure_ascii=False, sort_keys=True)}"
+    except Exception:
+        return tool_name or ""
+
+
+def _recent_same_tool_identity_count(messages, tool_name: str, tool_input=None) -> int:
+    target = _tool_identity(tool_name, tool_input)
     count = 0
     started = False
     for msg in reversed(messages or []):
@@ -31,13 +76,13 @@ def _recent_same_tool_name_count(messages, tool_name: str) -> int:
             if started:
                 break
             continue
-        names = [b.get("name") for b in content if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name")]
-        if not names:
+        tools = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name")]
+        if not tools:
             if started:
                 break
             continue
         started = True
-        if len(set(names)) == 1 and names[0] == tool_name:
+        if len(tools) == 1 and _tool_identity(tools[0].get("name", ""), tools[0].get("input", {})) == target:
             count += 1
             continue
         break
@@ -122,6 +167,7 @@ async def anthropic_messages(request: Request):
     if stream:
         async def generate():
             current_prompt = prompt
+            excluded_accounts = set()
             max_attempts = settings.MAX_RETRIES + (1 if tools else 0)
             for stream_attempt in range(max_attempts):
               try:
@@ -129,10 +175,14 @@ async def anthropic_messages(request: Request):
                 chat_id = None
                 acc = None
                 
-                async for item in client.chat_stream_events_with_retry(qwen_model, current_prompt, has_custom_tools=bool(tools)):
+                async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts):
+                    if item["type"] == "keepalive":
+                        yield ": keepalive\n\n"
+                        continue
                     if item["type"] == "meta":
                         chat_id = item["chat_id"]
                         acc = item["acc"]
+                        yield ": upstream-connected\n\n"
                         continue
                     if item["type"] == "event":
                         events.append(item["event"])
@@ -187,7 +237,10 @@ async def anthropic_messages(request: Request):
                             if chat_id:
                                 import asyncio
                                 asyncio.create_task(client.delete_chat(acc.token, chat_id))
-                        log.warning(f"[NativeBlock-ANT] Qwen拦截原生工具调用 '{blocked_name}'，注入格式纠正后重试 (attempt {stream_attempt+1}/{max_attempts})")
+                        if acc: excluded_accounts.add(acc.email)
+                        log.warning(f"[NativeBlock-ANT] Qwen???????? '{blocked_name}'??????????????? (attempt {stream_attempt+1}/{max_attempts})")
+                        current_prompt = inject_format_reminder(current_prompt, blocked_name)
+                        await asyncio.sleep(0.15)
                         current_prompt = inject_format_reminder(current_prompt, blocked_name)
                         await asyncio.sleep(0.15)
                         continue
@@ -219,11 +272,11 @@ async def anthropic_messages(request: Request):
                                     current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:"
                                 else:
                                     current_prompt += "\n\n" + force_text + "\nAssistant:"
-                                log.warning(f"[ToolLoop-ANT] 检测到 Unchanged since last read，阻止重复 Read (attempt {stream_attempt+1}/{max_attempts})")
+                                log.warning(f"[ToolLoop-ANT] ??? Unchanged since last read????? Read (attempt {stream_attempt+1}/{max_attempts})")
                                 await asyncio.sleep(0.15)
                                 continue
-                            same_tool_count = _recent_same_tool_name_count(history_messages, tool_blk.get("name", ""))
-                            if same_tool_count >= 2 and stream_attempt < max_attempts - 1:
+                            same_tool_count = _recent_same_tool_identity_count(history_messages, tool_blk.get("name", ""), tool_blk.get("input", {}))
+                            if tool_blk.get("name") != "Read" and same_tool_count >= 2 and stream_attempt < max_attempts - 1:
                                 if acc:
                                     client.account_pool.release(acc)
                                     if chat_id:
@@ -241,7 +294,7 @@ async def anthropic_messages(request: Request):
                                     current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:"
                                 else:
                                     current_prompt += "\n\n" + force_text + "\nAssistant:"
-                                log.warning(f"[ToolLoop-ANT] 工具 {n} 连续调用已达2次，强制改用其他工具 (attempt {stream_attempt+1}/{max_attempts})")
+                                log.warning(f"[ToolLoop-ANT] ?? {n} ??????2??????????????? (attempt {stream_attempt+1}/{max_attempts})")
                                 await asyncio.sleep(0.15)
                                 continue
                     if stop_reason != "tool_use" and not answer_text.strip() and stream_attempt < max_attempts - 1:
@@ -264,7 +317,7 @@ async def anthropic_messages(request: Request):
                                 "Choose the best tool from the provided list by yourself. "
                                 "Do not answer in plain text.\nAssistant:"
                             )
-                        log.warning(f"[ToolParse-ANT] 未提取到工具调用，强制下一轮仅输出工具调用 (attempt {stream_attempt+1}/{max_attempts})")
+                        log.warning(f"[ToolParse-ANT] ???????????????????? (attempt {stream_attempt+1}/{max_attempts})")
                         await asyncio.sleep(0.15)
                         continue
                 else:
@@ -313,6 +366,11 @@ async def anthropic_messages(request: Request):
                 yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': he.detail}})}\n\n"
                 return
               except Exception as e:
+                if acc and acc.inflight > 0:
+                    client.account_pool.release(acc)
+                    if chat_id:
+                        import asyncio
+                        asyncio.create_task(client.delete_chat(acc.token, chat_id))
                 yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)}})}\n\n"
                 return
 
@@ -320,14 +378,16 @@ async def anthropic_messages(request: Request):
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     else:
         current_prompt = prompt
+        excluded_accounts = set()
         max_attempts = settings.MAX_RETRIES + (1 if tools else 0)
+        excluded_accounts = set()
         for stream_attempt in range(max_attempts):
             try:
                 events = []
                 chat_id = None
                 acc = None
                 
-                async for item in client.chat_stream_events_with_retry(qwen_model, current_prompt, has_custom_tools=bool(tools)):
+                async for item in client.chat_stream_events_with_retry(qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts):
                     if item["type"] == "meta":
                         chat_id = item["chat_id"]
                         acc = item["acc"]
@@ -385,6 +445,8 @@ async def anthropic_messages(request: Request):
                             if chat_id:
                                 import asyncio
                                 asyncio.create_task(client.delete_chat(acc.token, chat_id))
+                        if acc: excluded_accounts.add(acc.email)
+                        log.warning(f"[NativeBlock-ANT] Qwen???????? '{blocked_name}'??????????????? (attempt {stream_attempt+1}/{max_attempts})")
                         current_prompt = inject_format_reminder(current_prompt, blocked_name)
                         await asyncio.sleep(0.15)
                         continue
@@ -416,11 +478,11 @@ async def anthropic_messages(request: Request):
                                     current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:"
                                 else:
                                     current_prompt += "\n\n" + force_text + "\nAssistant:"
-                                log.warning(f"[ToolLoop-ANT] 检测到 Unchanged since last read，阻止重复 Read (attempt {stream_attempt+1}/{max_attempts})")
+                                log.warning(f"[ToolLoop-ANT] ??? Unchanged since last read????? Read (attempt {stream_attempt+1}/{max_attempts})")
                                 await asyncio.sleep(0.15)
                                 continue
-                            same_tool_count = _recent_same_tool_name_count(history_messages, tool_blk.get("name", ""))
-                            if same_tool_count >= 2 and stream_attempt < max_attempts - 1:
+                            same_tool_count = _recent_same_tool_identity_count(history_messages, tool_blk.get("name", ""), tool_blk.get("input", {}))
+                            if tool_blk.get("name") != "Read" and same_tool_count >= 2 and stream_attempt < max_attempts - 1:
                                 if acc:
                                     client.account_pool.release(acc)
                                     if chat_id:
@@ -438,10 +500,10 @@ async def anthropic_messages(request: Request):
                                     current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:"
                                 else:
                                     current_prompt += "\n\n" + force_text + "\nAssistant:"
-                                log.warning(f"[ToolLoop-ANT] 工具 {n} 连续调用已达2次，强制改用其他工具 (attempt {stream_attempt+1}/{max_attempts})")
+                                if acc: excluded_accounts.add(acc.email)
+                                log.warning(f"[ToolLoop-ANT] ?? {n} ??????2??????????????? (attempt {stream_attempt+1}/{max_attempts})")
                                 await asyncio.sleep(0.15)
                                 continue
-                    if stop_reason != "tool_use" and not answer_text.strip() and stream_attempt < max_attempts - 1:
                         if acc:
                             client.account_pool.release(acc)
                             if chat_id:
@@ -461,7 +523,7 @@ async def anthropic_messages(request: Request):
                                 "Choose the best tool from the provided list by yourself. "
                                 "Do not answer in plain text.\nAssistant:"
                             )
-                        log.warning(f"[ToolParse-ANT] 未提取到工具调用，强制下一轮仅输出工具调用 (attempt {stream_attempt+1}/{max_attempts})")
+                        log.warning(f"[ToolParse-ANT] ???????????????????? (attempt {stream_attempt+1}/{max_attempts})")
                         await asyncio.sleep(0.15)
                         continue
                 else:
@@ -493,6 +555,11 @@ async def anthropic_messages(request: Request):
                     "usage": {"input_tokens": len(prompt), "output_tokens": len(answer_text)}
                 })
             except Exception as e:
+                if acc and acc.inflight > 0:
+                    client.account_pool.release(acc)
+                    if chat_id:
+                        import asyncio
+                        asyncio.create_task(client.delete_chat(acc.token, chat_id))
                 if stream_attempt == max_attempts - 1:
                     raise HTTPException(status_code=500, detail=str(e))
                 await asyncio.sleep(1)

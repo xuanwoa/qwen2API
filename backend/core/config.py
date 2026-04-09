@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 from pathlib import Path
 from pydantic_settings import BaseSettings
@@ -8,20 +8,21 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = BASE_DIR / "data"
 
 class Settings(BaseSettings):
-    # 服务配置
+    # 鏈嶅姟閰嶇疆
     PORT: int = int(os.getenv("PORT", 8080))
     WORKERS: int = int(os.getenv("WORKERS", 3))
     ADMIN_KEY: str = os.getenv("ADMIN_KEY", "admin")
 
-    # 浏览器引擎配置
-    BROWSER_POOL_SIZE: int = int(os.getenv("BROWSER_POOL_SIZE", 2))
-    MAX_INFLIGHT_PER_ACCOUNT: int = int(os.getenv("MAX_INFLIGHT", 1))
+    # 娴忚鍣ㄥ紩鎿庨厤缃?
+    BROWSER_POOL_SIZE: int = int(os.getenv("BROWSER_POOL_SIZE", 4))
+    MAX_INFLIGHT_PER_ACCOUNT: int = int(os.getenv("MAX_INFLIGHT", 4))
+    STREAM_KEEPALIVE_INTERVAL: int = int(os.getenv("STREAM_KEEPALIVE_INTERVAL", 5))
 
-    # 容灾与限流
+    # 瀹圭伨涓庨檺娴?
     MAX_RETRIES: int = 3
     RATE_LIMIT_COOLDOWN: int = 600
 
-    # 数据文件路径
+    # 鏁版嵁鏂囦欢璺緞
     ACCOUNTS_FILE: str = os.getenv("ACCOUNTS_FILE", str(DATA_DIR / "accounts.json"))
     USERS_FILE: str = os.getenv("USERS_FILE", str(DATA_DIR / "users.json"))
     CAPTURES_FILE: str = os.getenv("CAPTURES_FILE", str(DATA_DIR / "captures.json"))
@@ -47,14 +48,14 @@ def save_api_keys(keys: set):
     with open(API_KEYS_FILE, "w", encoding="utf-8") as f:
         json.dump({"keys": list(keys)}, f, indent=2)
 
-# 在内存中存储管理的 API Keys
+# 鍦ㄥ唴瀛樹腑瀛樺偍绠＄悊鐨?API Keys
 API_KEYS = load_api_keys()
 
 VERSION = "2.0.0"
 
 settings = Settings()
 
-# 全局映射
+# 鍏ㄥ眬鏄犲皠
 MODEL_MAP = {
     # OpenAI
     "gpt-4o":            "qwen3.6-plus",

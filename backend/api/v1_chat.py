@@ -15,6 +15,41 @@ from backend.core.config import resolve_model, settings
 log = logging.getLogger("qwen2api.chat")
 router = APIRouter()
 
+async def _stream_items_with_keepalive(client, model: str, prompt: str, has_custom_tools: bool, exclude_accounts=None):
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _producer():
+        try:
+            async for item in client.chat_stream_events_with_retry(model, prompt, has_custom_tools=has_custom_tools, exclude_accounts=exclude_accounts):
+                await queue.put(("item", item))
+        except Exception as e:
+            await queue.put(("error", e))
+        finally:
+            await queue.put(("done", None))
+
+    producer_task = asyncio.create_task(_producer())
+    try:
+        while True:
+            try:
+                kind, payload = await asyncio.wait_for(queue.get(), timeout=max(1, settings.STREAM_KEEPALIVE_INTERVAL))
+            except asyncio.TimeoutError:
+                yield {"type": "keepalive"}
+                continue
+
+            if kind == "item":
+                yield payload
+            elif kind == "error":
+                raise payload
+            elif kind == "done":
+                break
+    finally:
+        if not producer_task.done():
+            producer_task.cancel()
+            try:
+                await producer_task
+            except asyncio.CancelledError:
+                pass
+
 def _extract_blocked_tool_names(text: str) -> list[str]:
     if not text:
         return []
@@ -100,6 +135,7 @@ async def chat_completions(request: Request):
     if stream:
         async def generate():
             current_prompt = prompt  # local copy so we can modify for native-block retries
+            excluded_accounts = set()
             for stream_attempt in range(settings.MAX_RETRIES):
               try:
                 # We need to simulate `_stream_with_retry` behavior using `client.chat_stream_events_with_retry`
@@ -108,10 +144,14 @@ async def chat_completions(request: Request):
                 acc = None
                 
                 # Fetch all events (buffered)
-                async for item in client.chat_stream_events_with_retry(qwen_model, current_prompt, has_custom_tools=bool(tools)):
+                async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts):
+                    if item["type"] == "keepalive":
+                        yield ": keepalive\n\n"
+                        continue
                     if item["type"] == "meta":
                         chat_id = item["chat_id"]
                         acc = item["acc"]
+                        yield ": upstream-connected\n\n"
                         continue
                     if item["type"] == "event":
                         events.append(item["event"])
@@ -167,6 +207,7 @@ async def chat_completions(request: Request):
                             import asyncio
                             asyncio.create_task(client.delete_chat(acc.token, chat_id))
                     log.warning(f"[NativeBlock-Stream] Qwen拦截原生工具调用 '{blocked_name}'，注入格式纠正后重试 (attempt {stream_attempt+1}/{settings.MAX_RETRIES})")
+                    if acc: excluded_accounts.add(acc.email)
                     current_prompt = inject_format_reminder(current_prompt, blocked_name)
                     await asyncio.sleep(0.15)
                     continue  # retry the stream call
@@ -244,6 +285,11 @@ async def chat_completions(request: Request):
                 yield f"data: {json.dumps({'error': he.detail})}\n\n"
                 return
               except Exception as e:
+                if acc and acc.inflight > 0:
+                    client.account_pool.release(acc)
+                    if chat_id:
+                        import asyncio
+                        asyncio.create_task(client.delete_chat(acc.token, chat_id))
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
                 return
 
@@ -251,13 +297,14 @@ async def chat_completions(request: Request):
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     else:
         current_prompt = prompt
+        excluded_accounts = set()
         for stream_attempt in range(settings.MAX_RETRIES):
             try:
                 events = []
                 chat_id = None
                 acc = None
                 
-                async for item in client.chat_stream_events_with_retry(qwen_model, current_prompt, has_custom_tools=bool(tools)):
+                async for item in client.chat_stream_events_with_retry(qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts):
                     if item["type"] == "meta":
                         chat_id = item["chat_id"]
                         acc = item["acc"]
@@ -379,6 +426,11 @@ async def chat_completions(request: Request):
                               "total_tokens": len(prompt) + len(answer_text)}
                 })
             except Exception as e:
+                if acc and acc.inflight > 0:
+                    client.account_pool.release(acc)
+                    if chat_id:
+                        import asyncio
+                        asyncio.create_task(client.delete_chat(acc.token, chat_id))
                 if stream_attempt == settings.MAX_RETRIES - 1:
                     raise HTTPException(status_code=500, detail=str(e))
                 await asyncio.sleep(1)

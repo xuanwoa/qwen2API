@@ -7,7 +7,7 @@ import { getAuthHeader } from "../lib/auth"
 export default function SettingsPage() {
   const [settings, setSettings] = useState<any>(null)
   const [sessionKey, setSessionKey] = useState("")
-  const [maxInflight, setMaxInflight] = useState(2)
+  const [maxInflight, setMaxInflight] = useState(4)
   const [modelAliases, setModelAliases] = useState("")
   
   const loadSessionKey = () => {
@@ -22,7 +22,7 @@ export default function SettingsPage() {
       })
       .then(data => {
         setSettings(data)
-        setMaxInflight(data.max_inflight_per_account || 2)
+        setMaxInflight(data.max_inflight_per_account || 4)
         setModelAliases(JSON.stringify(data.model_aliases || {}, null, 2))
       })
       .catch(() => toast.error("配置获取失败，请检查会话 Key"))
