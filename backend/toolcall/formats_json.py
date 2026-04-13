@@ -1,12 +1,25 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .normalize import normalize_arguments, normalize_tool_name
 
 
 JSON_INPUT_KEYS = ("input", "arguments", "args", "parameters")
+
+
+def _repair_loose_json(text: str) -> str:
+    repaired = text.strip()
+    if not repaired:
+        return repaired
+    repaired = repaired.replace('"name="', '"name": "')
+    repaired = re.sub(r'"name=([^",}]+)"', r'"name": "\1"', repaired)
+    repaired = re.sub(r'"name=([^",}]+)', r'"name": "\1"', repaired)
+    repaired = re.sub(r'"name\s*=\s*"', '"name": "', repaired)
+    repaired = re.sub(r'"(name|input|arguments|args|parameters)"\s*=\s*', r'"\1": ', repaired)
+    return repaired
 
 
 def _extract_call(payload: object, allowed_names: set[str]) -> dict[str, Any] | None:
@@ -41,7 +54,13 @@ def parse_json_format(text: str, allowed_names: set[str]) -> list[dict[str, Any]
     try:
         payload = json.loads(stripped)
     except (json.JSONDecodeError, TypeError, ValueError):
-        return []
+        repaired = _repair_loose_json(stripped)
+        if repaired == stripped:
+            return []
+        try:
+            payload = json.loads(repaired)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return []
 
     if isinstance(payload, dict) and isinstance(payload.get("tool_calls"), list):
         calls = []

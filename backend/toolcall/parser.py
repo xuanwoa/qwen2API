@@ -17,8 +17,12 @@ def _has_top_level_json_tool_syntax(text: str) -> bool:
     if not stripped.startswith("{"):
         return False
 
+    repaired = stripped.replace('"name="', '"name": "')
+    if '"name=' in repaired:
+        return True
+
     try:
-        payload = json.loads(stripped)
+        payload = json.loads(repaired)
     except (json.JSONDecodeError, TypeError, ValueError):
         return False
 
@@ -31,6 +35,11 @@ def _has_top_level_json_tool_syntax(text: str) -> bool:
     has_name = isinstance(payload.get("name"), str) and bool(payload.get("name"))
     has_args = any(key in payload for key in ("input", "arguments", "args", "parameters"))
     return has_name and has_args
+
+
+def _has_xml_like_tool_syntax(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in ("<invoke", "<tool_call", "</tool_call>"))
 
 
 def parse_tool_calls_detailed(text: str, allowed_names: set[str]) -> dict[str, object]:
@@ -53,6 +62,7 @@ def parse_tool_calls_detailed(text: str, allowed_names: set[str]) -> dict[str, o
         "source": None,
         "saw_tool_syntax": (
             _has_top_level_json_tool_syntax(text)
-            or any(marker in text for marker in ("<invoke", "function.name:", "function.arguments:"))
+            or _has_xml_like_tool_syntax(text)
+            or any(marker in text for marker in ("function.name:", "function.arguments:", '"name="'))
         ),
     }
