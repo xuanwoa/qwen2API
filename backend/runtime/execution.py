@@ -106,6 +106,7 @@ __all__ = [
     "anthropic_stream_usage_delta",
     "build_retry_loop",
     "build_tool_directive",
+    "build_usage_delta_factory",
     "begin_runtime_attempt",
     "cleanup_runtime_resources",
     "collect_completion_run",
@@ -433,6 +434,10 @@ def inject_assistant_message(prompt: str, message: str) -> str:
 
 def retryable_usage_delta(prompt: str):
     return lambda execution, _: len(execution.state.answer_text) + len(prompt)
+
+
+def build_usage_delta_factory(prompt: str) -> Callable[[RuntimeExecutionResult, Any | None], int]:
+    return lambda execution, _=None: len(execution.state.answer_text) + len(prompt)
 
 
 def plan_runtime_attempts(request: StandardRequest, *, initial_prompt: str) -> RuntimeAttemptPlan:
