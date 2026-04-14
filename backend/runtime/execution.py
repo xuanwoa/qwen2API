@@ -252,6 +252,39 @@ def has_recent_openai_same_tool_call(history_messages: list[dict[str, Any]] | No
     return False
 
 
+def has_invalid_textual_tool_contract(answer_text: str) -> bool:
+    if not answer_text:
+        return False
+    if "##TOOL_CALL##" not in answer_text and "<tool_call>" not in answer_text:
+        return False
+    compact = answer_text.strip()
+    tc_m = re.search(r'##TOOL_CALL##\s*(.*?)\s*##END_CALL##', compact, re.DOTALL | re.IGNORECASE)
+    if tc_m:
+        try:
+            obj = json.loads(tc_m.group(1))
+        except (json.JSONDecodeError, ValueError):
+            return True
+        tool_input = obj.get("input", obj.get("args", obj.get("arguments", obj.get("parameters", {}))))
+        return isinstance(tool_input, str)
+    xml_m = re.search(r'<tool_call>\s*(.*?)\s*</tool_call>', compact, re.DOTALL | re.IGNORECASE)
+    if xml_m:
+        try:
+            obj = json.loads(xml_m.group(1))
+        except (json.JSONDecodeError, ValueError):
+            return True
+        tool_input = obj.get("input", obj.get("args", obj.get("arguments", obj.get("parameters", {}))))
+        return isinstance(tool_input, str)
+    return False
+
+
+def should_retry_textual_tool_contract(answer_text: str) -> bool:
+    if not answer_text:
+        return False
+    if "##TOOL_CALL##" in answer_text or "<tool_call>" in answer_text:
+        return True
+    return False
+
+
 def native_tool_calls_to_markup(tool_calls: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for tool_call in tool_calls:
@@ -505,13 +538,39 @@ def evaluate_retry_directive(
             ),
         )
 
-    if request.tools and state.answer_text:
-        directive = parse_tool_directive_once(request, state)
+    if request.tools:
+        directive: RuntimeToolDirective | None = None
+        if state.answer_text:
+            saw_contract_markup = should_retry_textual_tool_contract(state.answer_text)
+            if saw_contract_markup and not state.emitted_visible_output:
+                if has_invalid_textual_tool_contract(state.answer_text):
+                    fallback_tool_name = request.tool_names[0] if request.tool_names else "tool"
+                    return RuntimeRetryDirective(
+                        retry=True,
+                        next_prompt=tool_parser.inject_format_reminder(
+                            current_prompt,
+                            fallback_tool_name,
+                            client_profile=getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE),
+                        ),
+                    )
+                directive = parse_tool_directive_once(request, state)
+                if directive.stop_reason != "tool_use":
+                    fallback_tool_name = request.tool_names[0] if request.tool_names else "tool"
+                    return RuntimeRetryDirective(
+                        retry=True,
+                        next_prompt=tool_parser.inject_format_reminder(
+                            current_prompt,
+                            fallback_tool_name,
+                            client_profile=getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE),
+                        ),
+                    )
+        if directive is None:
+            directive = parse_tool_directive_once(request, state)
         if directive.stop_reason == "tool_use":
             first_tool = next((b for b in directive.tool_blocks if b.get("type") == "tool_use"), None)
             if first_tool:
                 repeated_same_tool = False
-                if getattr(request, "client_profile", "openclaw_openai") == "openclaw_openai":
+                if getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE) == "openclaw_openai":
                     repeated_same_tool = has_recent_openai_same_tool_call(
                         history_messages,
                         first_tool.get("name", ""),

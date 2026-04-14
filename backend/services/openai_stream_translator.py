@@ -3,8 +3,14 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
+from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE
 from backend.runtime.execution import RuntimeToolDirective
 from backend.toolcall.parser import parse_tool_calls_detailed
+
+
+STRICT_TOOL_TEXT_PREFIXES = ("{", "[", "`", "<")
+BUFFERED_TOOL_CALLS_ONLY = "buffered_tool_calls_only"
+DIRECTIVE_DRIVEN_TOOL_CALLS = "directive_driven_tool_calls"
 
 
 class OpenAIStreamTranslator:
@@ -28,9 +34,23 @@ class OpenAIStreamTranslator:
         self.role_chunk_sent = False
         self.emitted_tool_index = 0
         self.answer_fragments: list[str] = []
-        self.visible_text_fragments: list[str] = []
         self.buffered_toolish_fragments: list[str] = []
+        self.pending_content_chunks: list[str] = []
         self.tool_calls_emitted = False
+        self.tool_text_detection_mode = self._resolve_tool_text_detection_mode(client_profile)
+        self.tool_call_finalize_mode = self._resolve_tool_call_finalize_mode(client_profile)
+
+    @staticmethod
+    def _resolve_tool_text_detection_mode(client_profile: str) -> str:
+        if client_profile == OPENCLAW_OPENAI_PROFILE:
+            return "strict_prefix"
+        return "accept_any_tool_syntax"
+
+    @staticmethod
+    def _resolve_tool_call_finalize_mode(client_profile: str) -> str:
+        if client_profile == CLAUDE_CODE_OPENAI_PROFILE:
+            return BUFFERED_TOOL_CALLS_ONLY
+        return DIRECTIVE_DRIVEN_TOOL_CALLS
 
     def _looks_like_tool_output(self, text_chunk: str) -> bool:
         if not text_chunk:
@@ -42,8 +62,18 @@ class OpenAIStreamTranslator:
         if self.allowed_tool_names:
             detailed = parse_tool_calls_detailed(text_chunk, self.allowed_tool_names)
             if detailed.get("saw_tool_syntax"):
+                if self.tool_text_detection_mode == "strict_prefix":
+                    stripped = text_chunk.lstrip()
+                    return stripped.startswith(STRICT_TOOL_TEXT_PREFIXES)
                 return True
         return False
+
+    def _should_finalize_tool_calls(self, directive: RuntimeToolDirective) -> bool:
+        if directive.stop_reason != "tool_use":
+            return False
+        if self.tool_call_finalize_mode == BUFFERED_TOOL_CALLS_ONLY:
+            return bool(self.buffered_toolish_fragments)
+        return True
 
     def _ensure_role_chunk(self) -> None:
         if self.role_chunk_sent:
@@ -59,9 +89,18 @@ class OpenAIStreamTranslator:
         self.role_chunk_sent = True
 
     def _emit_content_chunk(self, text_chunk: str) -> None:
-        self.pending_chunks.append(
+        chunk = (
             f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'content': text_chunk}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
         )
+        self.pending_chunks.append(chunk)
+        self.pending_content_chunks.append(chunk)
+
+    def _discard_pending_content_chunks(self) -> None:
+        if not self.pending_content_chunks:
+            return
+        pending_content_ids = {id(chunk) for chunk in self.pending_content_chunks}
+        self.pending_chunks = [chunk for chunk in self.pending_chunks if id(chunk) not in pending_content_ids]
+        self.pending_content_chunks = []
 
     def on_delta(self, evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
         self._ensure_role_chunk()
@@ -76,7 +115,6 @@ class OpenAIStreamTranslator:
             elif self.buffered_toolish_fragments:
                 self.buffered_toolish_fragments.append(text_chunk)
             else:
-                self.visible_text_fragments.append(text_chunk)
                 self._emit_content_chunk(text_chunk)
             return
 
@@ -99,9 +137,8 @@ class OpenAIStreamTranslator:
         buffered_text = "".join(self.buffered_toolish_fragments)
         if self.build_final_directive is not None and not self.tool_calls_emitted:
             directive = self.build_final_directive("".join(self.answer_fragments))
-            if directive.stop_reason == "tool_use":
-                self.pending_chunks = [chunk for chunk in self.pending_chunks if '"content"' not in chunk]
-                self.visible_text_fragments = []
+            if self._should_finalize_tool_calls(directive):
+                self._discard_pending_content_chunks()
                 tool_calls = [
                     {
                         "id": block["id"],
