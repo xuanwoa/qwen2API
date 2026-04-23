@@ -43,3 +43,4 @@ fix_*.py
 # local cleanup
 tests/
 docs/superpowers/
+q2a/

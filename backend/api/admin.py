@@ -29,6 +29,17 @@ class User(BaseModel):
     quota: int
     used_tokens: int
 
+class BatchAccountItem(BaseModel):
+    email: str
+    password: str = ""
+    token: str = ""
+    cookies: str = ""
+    username: str = ""
+
+class BatchAccountImportRequest(BaseModel):
+    items: list[BatchAccountItem]
+    refresh_tokens: bool = False
+
 @router.get("/status", dependencies=[Depends(verify_admin)])
 async def get_system_status(request: Request):
     pool = request.app.state.account_pool
@@ -157,6 +168,79 @@ async def list_accounts(request: Request):
         accs.append(d)
     return {"accounts": accs}
 
+@router.post("/accounts/batch", dependencies=[Depends(verify_admin)])
+async def batch_import_accounts(payload: BatchAccountImportRequest, request: Request):
+    from backend.services.qwen_client import QwenClient
+
+    pool: AccountPool = request.app.state.account_pool
+    client: QwenClient = request.app.state.qwen_client
+
+    results = []
+    imported = 0
+    refreshed = 0
+
+    for item in payload.items:
+        email = item.email.strip()
+        password = item.password.strip()
+        token = item.token.strip()
+        cookies = item.cookies.strip()
+        username = item.username.strip()
+
+        if not email:
+            results.append({"email": "", "ok": False, "error": "email is required"})
+            continue
+
+        existing = pool.get_by_email(email)
+        acc = existing or Account(email=email)
+        if password:
+            acc.password = password
+        if cookies:
+            acc.cookies = cookies
+        if username:
+            acc.username = username
+        if token:
+            acc.token = token
+
+        is_valid = False
+        refreshed_now = False
+        if acc.token:
+            try:
+                is_valid = await client.verify_token(acc.token)
+            except Exception as exc:
+                results.append({"email": email, "ok": False, "error": f"token verify failed: {exc}"})
+                continue
+
+        if (not is_valid) and payload.refresh_tokens and acc.password:
+            is_valid = await client.auth_resolver.refresh_token(acc)
+            if is_valid:
+                refreshed += 1
+                refreshed_now = True
+
+        acc.valid = is_valid
+        if is_valid:
+            acc.activation_pending = False
+            acc.status_code = "valid"
+            acc.last_error = ""
+        elif not acc.activation_pending:
+            acc.status_code = "auth_error" if acc.token else "invalid"
+        await pool.add(acc)
+        imported += 1
+        results.append({
+            "email": email,
+            "ok": True,
+            "valid": is_valid,
+            "status_code": acc.get_status_code(),
+            "token_present": bool(acc.token),
+            "refreshed": refreshed_now,
+        })
+
+    return {
+        "ok": True,
+        "imported": imported,
+        "refreshed": refreshed,
+        "results": results,
+    }
+
 @router.post("/accounts/register", dependencies=[Depends(verify_admin)])
 async def register_new_account(request: Request):
     """一键调用浏览器无头注册新千问账号"""
@@ -257,9 +341,15 @@ async def verify_account(email: str, request: Request):
         is_valid = await client.auth_resolver.refresh_token(acc)
 
     acc.valid = is_valid
+    if is_valid:
+        acc.activation_pending = False
+        acc.status_code = "valid"
+        acc.last_error = ""
+    elif not acc.activation_pending:
+        acc.status_code = "auth_error" if acc.token else "invalid"
     await pool.save() # 直接保存，不调用 mark_invalid 以免熔断影响正常测试
 
-    return {"email": acc.email, "valid": is_valid}
+    return {"email": acc.email, "valid": is_valid, "status_code": acc.get_status_code(), "last_error": acc.last_error}
 
 @router.delete("/accounts/{email}", dependencies=[Depends(verify_admin)])
 async def delete_account(email: str, request: Request):

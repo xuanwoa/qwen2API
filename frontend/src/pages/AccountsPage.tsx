@@ -72,6 +72,9 @@ export default function AccountsPage() {
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [token, setToken] = useState("")
+  const [batchInput, setBatchInput] = useState("")
+  const [batchRefreshTokens, setBatchRefreshTokens] = useState(true)
+  const [batchImporting, setBatchImporting] = useState(false)
   const [registering, setRegistering] = useState(false)
   const [registerUnlocked, setRegisterUnlocked] = useState(false)
   const [verifying, setVerifying] = useState<string | null>(null)
@@ -154,6 +157,53 @@ export default function AccountsPage() {
       toast.success(`\u5df2\u5220\u9664 ${targetEmail}`, { id })
       fetchAccounts()
     }).catch(() => toast.error("\u5220\u9664\u8d26\u53f7\u5931\u8d25", { id }))
+  }
+
+  const handleBatchImport = () => {
+    const lines = batchInput
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean)
+
+    if (!lines.length) {
+      toast.error("\u8bf7\u5148\u7c98\u8d34\u6279\u91cf\u8d26\u53f7\u5217\u8868")
+      return
+    }
+
+    const items = [] as { email: string; password: string }[]
+    for (const line of lines) {
+      const sep = line.indexOf(":")
+      if (sep <= 0) {
+        toast.error(`\u683c\u5f0f\u9519\u8bef\uff1a${line}`)
+        return
+      }
+      const parsedEmail = line.slice(0, sep).trim()
+      const parsedPassword = line.slice(sep + 1)
+      if (!parsedEmail || !parsedPassword) {
+        toast.error(`\u683c\u5f0f\u9519\u8bef\uff1a${line}`)
+        return
+      }
+      items.push({ email: parsedEmail, password: parsedPassword })
+    }
+
+    setBatchImporting(true)
+    const id = toast.loading("\u6b63\u5728\u6279\u91cf\u5bfc\u5165\u8d26\u53f7...")
+    fetch(`${API_BASE}/api/admin/accounts/batch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...getAuthHeader() },
+      body: JSON.stringify({ items, refresh_tokens: batchRefreshTokens })
+    }).then(res => res.json())
+      .then(data => {
+        if (data.ok) {
+          toast.success(`\u6279\u91cf\u5bfc\u5165\u5b8c\u6210\uff1a${data.imported} \u4e2a\uff0c\u5237\u65b0 token ${data.refreshed || 0} \u4e2a`, { id, duration: 8000 })
+          setBatchInput("")
+          fetchAccounts()
+        } else {
+          toast.error(localizeError(data.error) || "\u6279\u91cf\u5bfc\u5165\u5931\u8d25", { id, duration: 8000 })
+        }
+      })
+      .catch(() => toast.error("\u6279\u91cf\u5bfc\u5165\u8bf7\u6c42\u5931\u8d25", { id }))
+      .finally(() => setBatchImporting(false))
   }
 
   const handleAutoRegister = () => {
@@ -291,6 +341,34 @@ export default function AccountsPage() {
           </div>
           <Button onClick={handleAdd} variant="secondary" className="h-10 w-full md:w-auto font-semibold">
             <Plus className="mr-2 h-4 w-4" /> {"\u6ce8\u5165\u8d26\u53f7"}
+          </Button>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border bg-card/40 p-6 space-y-4">
+        <div>
+          <h3 className="text-base font-bold">{"\u6279\u91cf\u5bfc\u5165\u8d26\u53f7"}</h3>
+          <p className="text-sm text-muted-foreground">{"\u6309\u6bcf\u884c\u4e00\u4e2a `\u90ae\u7bb1:\u5bc6\u7801` \u7684\u683c\u5f0f\u7c98\u8d34\uff0c\u7a0b\u5e8f\u53ea\u4f1a\u7528\u7b2c\u4e00\u4e2a\u5192\u53f7\u5206\u5272\uff0c\u56e0\u6b64\u5bc6\u7801\u91cc\u540e\u7eed\u518d\u51fa\u73b0\u5192\u53f7\u4e5f\u80fd\u4fdd\u7559\u3002"}</p>
+        </div>
+        <textarea
+          value={batchInput}
+          onChange={e => setBatchInput(e.target.value)}
+          rows={10}
+          className="flex min-h-[220px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono"
+          placeholder={"user1@example.com:password123\nuser2@example.com:another-password"}
+        />
+        <label className="flex items-center gap-2 text-sm text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={batchRefreshTokens}
+            onChange={e => setBatchRefreshTokens(e.target.checked)}
+          />
+          <span>{"\u5bfc\u5165\u540e\u7acb\u5373\u5c1d\u8bd5\u767b\u5f55\u5e76\u8865 token"}</span>
+        </label>
+        <div className="flex justify-end">
+          <Button onClick={handleBatchImport} disabled={batchImporting} className="font-semibold">
+            {batchImporting ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : <Plus className="mr-2 h-4 w-4" />}
+            {batchImporting ? "\u6b63\u5728\u5bfc\u5165..." : "\u6279\u91cf\u5bfc\u5165"}
           </Button>
         </div>
       </div>
