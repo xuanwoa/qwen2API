@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import html as html_lib
 import json
 import logging
@@ -46,6 +47,41 @@ async def _verify_qwen_token(token: str) -> bool:
 async def get_fresh_token(email: str, password: str) -> str:
     """如果提供了此功能，用 playwright 重新登录获取 Token，这里提供一个 mock 或抛错以防未实现"""
     raise NotImplementedError("Auto-login not fully implemented yet in the separated architecture")
+
+def _hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+async def _login_via_http(email: str, password: str) -> str:
+    import httpx
+
+    payload = {
+        "email": email,
+        "password": _hash_password(password),
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": f"{BASE_URL}/auth",
+        "Origin": BASE_URL,
+        "Connection": "keep-alive",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(f"{BASE_URL}/api/v1/auths/signin", headers=headers, json=payload)
+    if resp.status_code != 200:
+        log.warning(f"[Refresh] {email} HTTP 登录失败，status={resp.status_code}, body={resp.text[:160]}")
+        return ""
+    try:
+        data = resp.json()
+    except Exception as e:
+        log.warning(f"[Refresh] {email} HTTP 登录返回非 JSON: {e}")
+        return ""
+    token = str(data.get("token", "") or "").strip()
+    if not token:
+        log.warning(f"[Refresh] {email} HTTP 登录未返回 token")
+        return ""
+    return token
 
 def _gen_password(length=14):
     chars = string.ascii_letters + string.digits + "!@#$%^&*"
@@ -679,6 +715,9 @@ async def activate_account(acc: Account) -> bool:
             log.warning(f"[激活] {acc.email} 邮件 API 失败: {e}")
 
         if not verify_link:
+            if not settings.AUTH_ALLOW_ACTIVATION_FALLBACK:
+                log.warning(f"[激活] {acc.email} 邮件 API 未返回链接，当前环境已禁用页面激活兜底")
+                return False
             log.info(f"[激活] {acc.email} 邮件 API 未返回链接，使用页面方式")
             verify_link = await _find_verify_link_via_mail_page(acc.email)
 
@@ -775,8 +814,35 @@ class AuthResolver:
         if not acc.email or not acc.password:
             log.warning(f"[Refresh] 账号 {acc.email} 无密码，无法刷新")
             return False
-            
+
         log.info(f"[Refresh] 正在为 {acc.email} 刷新 token...")
+
+        if settings.AUTH_HTTP_REFRESH_FIRST:
+            try:
+                old_token = acc.token
+                new_token = await _login_via_http(acc.email, acc.password)
+                if new_token:
+                    changed = new_token != old_token
+                    acc.token = new_token
+                    acc.valid = True
+                    acc.activation_pending = False
+                    acc.status_code = "valid"
+                    acc.last_error = ""
+                    await self.pool.save()
+                    if changed:
+                        old_prefix = old_token[:20] if old_token else "空"
+                        log.info(f"[Refresh] {acc.email} 已通过 HTTP 刷新 token ({old_prefix}... → {new_token[:20]}...)")
+                    else:
+                        log.info(f"[Refresh] {acc.email} HTTP 刷新后 token 未变化，重新标记有效")
+                    return True
+                log.warning(f"[Refresh] {acc.email} HTTP 刷新未拿到 token")
+            except Exception as e:
+                log.warning(f"[Refresh] {acc.email} HTTP 刷新异常: {e}")
+
+        if not settings.AUTH_ALLOW_BROWSER_FALLBACK:
+            log.warning(f"[Refresh] {acc.email} 当前环境已禁用浏览器刷新兜底")
+            return False
+
         try:
             async with _new_browser() as browser:
                 page = await browser.new_page()
@@ -785,12 +851,18 @@ class AuthResolver:
                     old_prefix = acc.token[:20] if acc.token else "空"
                     acc.token = new_token
                     acc.valid = True
+                    acc.activation_pending = False
+                    acc.status_code = "valid"
+                    acc.last_error = ""
                     await self.pool.save()
                     log.info(f"[Refresh] {acc.email} token 已更新 ({old_prefix}... → {new_token[:20]}...)")
                     return True
-                elif new_token == acc.token:
-                    # Token same but might still be valid — mark valid again
+                elif new_token == acc.token and new_token:
                     acc.valid = True
+                    acc.activation_pending = False
+                    acc.status_code = "valid"
+                    acc.last_error = ""
+                    await self.pool.save()
                     log.info(f"[Refresh] {acc.email} token 未变化，重新标记有效")
                     return True
                 else:

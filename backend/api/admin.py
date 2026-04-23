@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from backend.core.config import settings
 from backend.core.database import AsyncJsonDB
 from backend.core.account_pool import AccountPool, Account
+import asyncio
 import secrets
 
 router = APIRouter()
@@ -215,6 +216,8 @@ async def batch_import_accounts(payload: BatchAccountImportRequest, request: Req
             if is_valid:
                 refreshed += 1
                 refreshed_now = True
+            if settings.AUTH_REFRESH_BATCH_DELAY_MS > 0:
+                await asyncio.sleep(settings.AUTH_REFRESH_BATCH_DELAY_MS / 1000)
 
         acc.valid = is_valid
         if is_valid:
@@ -282,13 +285,22 @@ async def verify_all_accounts(request: Request):
 
     results = []
     for acc in pool.accounts:
-        is_valid = await client.verify_token(acc.token)
-        if not is_valid and acc.password:
+        was_invalid = not await client.verify_token(acc.token)
+        is_valid = not was_invalid
+        if was_invalid and acc.password:
             log.info(f"[校验] {acc.email} token失效，尝试自动刷新...")
             is_valid = await client.auth_resolver.refresh_token(acc)
+            if settings.AUTH_REFRESH_BATCH_DELAY_MS > 0:
+                await asyncio.sleep(settings.AUTH_REFRESH_BATCH_DELAY_MS / 1000)
 
         acc.valid = is_valid
-        results.append({"email": acc.email, "valid": is_valid, "refreshed": not is_valid})
+        if is_valid:
+            acc.activation_pending = False
+            acc.status_code = "valid"
+            acc.last_error = ""
+        elif not acc.activation_pending:
+            acc.status_code = "auth_error" if acc.token else "invalid"
+        results.append({"email": acc.email, "valid": is_valid, "refreshed": was_invalid and is_valid})
 
     await pool.save() # 直接保存全部状态，不调用 mark_invalid 以免熔断影响测试
     return {"ok": True, "results": results}

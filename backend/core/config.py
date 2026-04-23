@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     RATE_LIMIT_BASE_COOLDOWN: int = int(os.getenv("RATE_LIMIT_BASE_COOLDOWN", 600))
     RATE_LIMIT_MAX_COOLDOWN: int = int(os.getenv("RATE_LIMIT_MAX_COOLDOWN", 3600))
 
+    # 认证刷新与兜底
+    AUTH_HTTP_REFRESH_FIRST: bool = os.getenv("AUTH_HTTP_REFRESH_FIRST", "true").lower() in {"1", "true", "yes", "on"}
+    AUTH_ALLOW_BROWSER_FALLBACK: bool = os.getenv("AUTH_ALLOW_BROWSER_FALLBACK", "false").lower() in {"1", "true", "yes", "on"}
+    AUTH_ALLOW_ACTIVATION_FALLBACK: bool = os.getenv("AUTH_ALLOW_ACTIVATION_FALLBACK", "false").lower() in {"1", "true", "yes", "on"}
+    AUTH_REFRESH_BATCH_DELAY_MS: int = int(os.getenv("AUTH_REFRESH_BATCH_DELAY_MS", 1000))
+
     # 日志
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
