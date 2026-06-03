@@ -8,6 +8,7 @@ import re
 import time
 import json
 import logging
+from typing import Any
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 from backend.services.qwen_client import QwenClient
@@ -37,6 +38,50 @@ SUPPORTED_IMAGE_SIZES = {
 IMAGE_RATIO_TO_SIZE = {ratio: size for size, ratio in SUPPORTED_IMAGE_SIZES.items()}
 
 
+IMAGE_URL_KEYS = {
+    "url",
+    "image",
+    "src",
+    "imageUrl",
+    "image_url",
+    "imageURL",
+    "preview_url",
+    "previewUrl",
+    "download_url",
+    "downloadUrl",
+    "origin_url",
+    "originUrl",
+    "oss_url",
+    "ossUrl",
+    "signed_url",
+    "signedUrl",
+}
+
+
+def _looks_like_image_url(value: str) -> bool:
+    if not isinstance(value, str) or not value.startswith(("http://", "https://")):
+        return False
+    lowered = value.lower()
+    image_hosts = ("cdn.qwenlm.ai", "wanx.alicdn.com", "img.alicdn.com", "alicdn.com")
+    if any(host in lowered for host in image_hosts):
+        return True
+    return bool(re.search(r"\.(?:jpg|jpeg|png|webp|gif)(?:[?#][^\s\"'<>]*)?$", lowered))
+
+
+def _collect_image_urls_from_obj(value: Any, urls: list[str]) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, str) and (key in IMAGE_URL_KEYS or _looks_like_image_url(item)):
+                if _looks_like_image_url(item):
+                    urls.append(item)
+            else:
+                _collect_image_urls_from_obj(item, urls)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_image_urls_from_obj(item, urls)
+
+
 def _extract_image_urls(text: str) -> list[str]:
     urls: list[str] = []
 
@@ -50,6 +95,13 @@ def _extract_image_urls(text: str) -> list[str]:
     for u in re.findall(cdn_pattern, text, re.IGNORECASE):
         urls.append(u.rstrip(".,;)\"'>"))
 
+    for match in re.finditer(r"[\{\[]", text):
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(text[match.start():])
+        except Exception:
+            continue
+        _collect_image_urls_from_obj(obj, urls)
+
     seen: set[str] = set()
     result: list[str] = []
     for u in urls:
@@ -57,6 +109,30 @@ def _extract_image_urls(text: str) -> list[str]:
             seen.add(u)
             result.append(u)
     return result
+
+
+def _extract_upstream_failure(text: str) -> str | None:
+    for match in re.finditer(r"\{", text or ""):
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(text[match.start():])
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        request_id = obj.get("request_id") or obj.get("response_id") or "-"
+        if obj.get("success") is False:
+            data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+            code = data.get("code") or obj.get("code") or "upstream_error"
+            details = data.get("details") or data.get("message") or obj.get("details") or obj.get("message") or ""
+            return f"Qwen upstream error code={code} request_id={request_id} details={details}"
+        error = obj.get("error")
+        if isinstance(error, dict):
+            code = error.get("code") or "upstream_error"
+            details = error.get("details") or error.get("message") or error.get("type") or ""
+            return f"Qwen upstream error code={code} request_id={request_id} details={details}"
+        if isinstance(error, str) and error:
+            return f"Qwen upstream error request_id={request_id} details={error}"
+    return None
 
 
 def _resolve_image_model(requested: str | None) -> str:
@@ -154,11 +230,25 @@ async def create_image(request: Request):
         answer_text = "\n".join(event_payloads)
         if current_chat:
             answer_text += "\n" + json.dumps(current_chat, ensure_ascii=False)
+
+        upstream_failure = _extract_upstream_failure(answer_text)
+        if upstream_failure:
+            log.warning("[T2I] 上游返回失败 chat_id=%s error=%s", chat_id, upstream_failure)
+            raise HTTPException(status_code=502, detail=upstream_failure)
+
         image_urls = _extract_image_urls(answer_text)
-        log.info(f"[T2I] 提取到 {len(image_urls)} 张图片 URL: {image_urls}")
+        log.info(
+            "[T2I] 提取到 %s 张图片 URL: %s event_count=%s chat_found=%s chat_id=%s answer_tail=%r",
+            len(image_urls),
+            image_urls,
+            len(event_payloads),
+            bool(current_chat),
+            chat_id,
+            answer_text[-500:],
+        )
 
         if not image_urls:
-            raise HTTPException(status_code=500, detail="Image generation succeeded but no URL found")
+            raise HTTPException(status_code=500, detail=f"Image generation produced no image URL (chat_id={chat_id})")
 
         data = [{"url": url, "revised_prompt": prompt, "size": size, "ratio": ratio, "width": width, "height": height} for url in image_urls[:n]]
         return JSONResponse({"created": int(time.time()), "data": data})
@@ -166,8 +256,11 @@ async def create_image(request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"[T2I] 生成失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        detail = str(e)
+        log.error("[T2I] 生成失败: %s", detail)
+        if "Qwen upstream error" in detail:
+            raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
     finally:
         if acc is not None:
             client.account_pool.release(acc)

@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 from backend.adapter.standard_request import StandardRequest
 from backend.core.config import settings
 from backend.core.request_logging import new_request_id, request_context, update_request_context
+from backend.core.request_trace import log_test_prompt, prompt_tail
 from backend.services.attachment_preprocessor import preprocess_attachments
 from backend.services.context_attachment_manager import prepare_context_attachments, derive_session_key
 from backend.services.auth_quota import resolve_auth_context
@@ -114,6 +115,14 @@ async def chat_completions(request: Request):
     created = int(time.time())
 
     with request_context(req_id=new_request_id(), surface="openai", requested_model=model_name, resolved_model=qwen_model):
+        log_test_prompt(
+            log,
+            surface="openai",
+            model=qwen_model,
+            stream=standard_request.stream,
+            tools=[t.get("name") for t in tools],
+            prompt=prompt,
+        )
         log.info(
             "[OAI] model=%s stream=%s tool_enabled=%s profile=%s tools=%s prompt_len=%s prompt_tail=%r",
             qwen_model,
@@ -122,7 +131,7 @@ async def chat_completions(request: Request):
             standard_request.client_profile,
             [t.get('name') for t in tools],
             len(prompt),
-            prompt[-500:],
+            prompt_tail(prompt),
         )
 
         if standard_request.stream:
@@ -137,6 +146,7 @@ async def chat_completions(request: Request):
                         build_final_directive=lambda answer_text: build_tool_directive(
                             standard_request,
                             RuntimeAttemptState(answer_text=answer_text),
+                            history_messages=history_messages,
                         ),
                         allowed_tool_names=standard_request.tool_names,
                     )
@@ -168,7 +178,7 @@ async def chat_completions(request: Request):
                                 on_delta=on_delta,
                             )
                             execution = result.execution
-                            directive = result.directive or build_tool_directive(standard_request, execution.state)
+                            directive = result.directive or build_tool_directive(standard_request, execution.state, history_messages=history_messages)
                             assistant_message = build_openai_assistant_history_message(
                                 execution=execution,
                                 request=standard_request,
@@ -182,7 +192,7 @@ async def chat_completions(request: Request):
                                 assistant_message=assistant_message,
                             )
                             final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else execution.state.finish_reason
-                            for chunk in translator.finalize(final_finish_reason):
+                            for chunk in translator.finalize(final_finish_reason, directive):
                                 await queue.put(chunk)
                         except HTTPException as he:
                             await clear_invalidated_session_chat(app=app, request=standard_request)
@@ -230,7 +240,7 @@ async def chat_completions(request: Request):
                     allow_after_visible_output=True,
                 )
                 execution = result.execution
-                directive = result.directive or build_tool_directive(standard_request, execution.state)
+                directive = result.directive or build_tool_directive(standard_request, execution.state, history_messages=history_messages)
                 assistant_message = build_openai_assistant_history_message(
                     execution=execution,
                     request=standard_request,
@@ -251,6 +261,7 @@ async def chat_completions(request: Request):
                     prompt=result.prompt,
                     execution=execution,
                     standard_request=standard_request,
+                    directive=directive,
                 ))
         except Exception as e:
             await clear_invalidated_session_chat(app=app, request=standard_request)

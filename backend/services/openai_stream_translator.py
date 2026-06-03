@@ -5,7 +5,7 @@ import re
 from typing import Any, Callable
 
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE
-from backend.runtime.execution import RuntimeToolDirective
+from backend.runtime.execution import RuntimeToolDirective, tool_directive_visible_text
 from backend.toolcall.parser import parse_tool_calls_detailed
 
 
@@ -255,12 +255,28 @@ class OpenAIStreamTranslator:
         if tool_calls:
             self.tool_calls_emitted = True
 
-    def finalize(self, finish_reason: str) -> list[str]:
+    def _emit_missing_safe_text(self, safe_text: str) -> bool:
+        if not safe_text:
+            return False
+        streamed_text = "".join(self.answer_fragments)
+        if safe_text.startswith(streamed_text):
+            missing_tail = safe_text[len(streamed_text):]
+            if missing_tail:
+                self._emit_content_chunk(missing_tail)
+                self.answer_fragments.append(missing_tail)
+            return bool(missing_tail)
+        self._discard_pending_content_chunks()
+        self._emit_content_chunk(safe_text)
+        self.answer_fragments = [safe_text]
+        return True
+
+    def finalize(self, finish_reason: str, directive: RuntimeToolDirective | None = None) -> list[str]:
         self._flush_pending_think_text()
         final_finish_reason = finish_reason
         buffered_text = "".join(self.buffered_toolish_fragments)
-        if self.build_final_directive is not None and not self.tool_calls_emitted:
+        if directive is None and self.build_final_directive is not None and not self.tool_calls_emitted:
             directive = self.build_final_directive("".join(self.answer_fragments))
+        if directive is not None and not self.tool_calls_emitted:
             if self._should_finalize_tool_calls(directive):
                 self._discard_pending_content_chunks()
                 tool_calls = [
@@ -275,6 +291,9 @@ class OpenAIStreamTranslator:
                 if tool_calls:
                     self.emit_tool_calls(tool_calls)
                     final_finish_reason = "tool_calls"
+            elif safe_text := tool_directive_visible_text(directive, ""):
+                self._emit_missing_safe_text(safe_text)
+                final_finish_reason = "stop"
             elif buffered_text:
                 self._emit_content_chunk(buffered_text)
         elif buffered_text and not self.tool_calls_emitted:

@@ -225,6 +225,8 @@ class CLIProxy:
         Returns:
             dict: Claude 格式的响应
         """
+        from backend.runtime.execution import tool_directive_visible_text
+
         content_blocks: list[dict] = []
 
         # 添加思考内容
@@ -233,6 +235,13 @@ class CLIProxy:
 
         # 添加工具调用块
         content_blocks.extend(directive.tool_blocks)
+        visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
+        if (
+            directive.stop_reason != "tool_use"
+            and visible_text
+            and not any(block.get("type") == "text" for block in content_blocks)
+        ):
+            content_blocks.append({"type": "text", "text": visible_text})
 
         return {
             "id": msg_id,
@@ -244,7 +253,7 @@ class CLIProxy:
             "stop_sequence": None,
             "usage": {
                 "input_tokens": len(standard_request.prompt),
-                "output_tokens": len(execution.state.answer_text),
+                "output_tokens": len(visible_text),
             },
         }
 

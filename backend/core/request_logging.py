@@ -16,6 +16,7 @@ _REQUEST_DEFAULTS: dict[str, Any] = {
     "chat_id": "-",
     "stream_attempt": "-",
     "upstream_attempt": "-",
+    "test_marker": "-",
 }
 
 _LOG_FORMAT = (

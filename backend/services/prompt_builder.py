@@ -331,6 +331,48 @@ def _compact_tool_result_body(body: str, *, limit: int = 8000, head: int = 3000,
     return f"{body[:head]}\n...[truncated {dropped} bytes from middle]...\n{body[-tail:]}"
 
 
+def _message_contains_tool_result(message: dict) -> bool:
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(part, dict) and part.get("type") in {"tool_result", "function_call_output"}
+        for part in content
+    )
+
+
+def _latest_message_is_tool_result(messages: list, client_profile: str) -> bool:
+    for message in reversed(messages or []):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", "")
+        if message.get("role") == "tool":
+            return True
+        if message.get("role") == "user":
+            user_text = _extract_user_text_only(content, client_profile=client_profile).strip()
+            if _message_contains_tool_result(message) and not user_text:
+                return True
+            if user_text:
+                return False
+        elif message.get("role") == "assistant":
+            return False
+    return False
+
+
+def _build_tool_result_followup_notice(messages: list, tools: list, client_profile: str) -> str:
+    if not messages or not tools or client_profile != CLAUDE_CODE_OPENAI_PROFILE:
+        return ""
+    if not _latest_message_is_tool_result(messages, client_profile):
+        return ""
+    return (
+        "[STATE NOTICE: MUST OBEY]\n"
+        "The latest client message is a tool result, not a new user request.\n"
+        "Use that result to continue from the current state or finish the task.\n"
+        "If the latest result reports a successful Write/Edit/NotebookEdit, do NOT repeat the exact same write/edit payload for the same target; only write again when the new payload changes or completes the file.\n"
+        "Do NOT restart the original task merely because it appears earlier in the prompt."
+    )
+
+
 def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, client_profile: str = OPENCLAW_OPENAI_PROFILE, workspace_root: str | None = None) -> str:
     # 闂傚倸鍊搁崐宄懊归崶顒婄稏濠㈣埖鍔曠粻姘舵倶閻愭彃鈷旀い鈺佸级缁绘繈妫冨☉鍗炲壈闂佽棄鍟伴崰鏍蓟濞戙垹唯妞ゆ梻鍘ч～鈺呮⒑缁嬭儻顫﹂柛鏃€鍨垮璇测槈閵忕姷鍔撮梺鍛婂姉閸嬫捇鎮鹃崼鏇熲拺闁兼亽鍎遍悘銉︺亜閿旂偓鏆€殿喖顭烽弫鎾绘偐閼碱剦妲版俊鐐€栭幐楣冨窗閹捐违闁归偊鍠氱壕钘壝归敐鍛儓闁告棑绠撻弻娑氣偓锝庡亝鐏忔澘菐閸パ嶈含闁诡喗鐟╅、鏃堝礋閵娿儰澹曞┑鐐村灟閸╁嫰寮繝鍌楁斀闁绘ɑ褰冮顏嗏偓瑙勬礀瀵爼骞堥妸銉庣喖宕归鎯у缚闂備胶顭堥鍌炲疾濠婂懏宕叉繛鎴欏灩楠炪垺淇婇姘倯闁革綆鍠氱槐鎾存媴閻熸澘顫嶉梺鎰佷簽椤ヮ柟tem 濠电姷鏁告慨鐑藉极閹间礁纾婚柣鎰惈閸ㄥ倿鏌ｉ姀鐘冲暈闁稿顑呴埞鎴︽偐閹绘帗娈?+ 婵犵數濮烽。钘壩ｉ崨鏉戠；闁规崘娉涚欢銈呂旈敐鍛殲闁稿顑嗘穱濠囧Χ閸屾矮澹曟俊?user 濠电姷鏁告慨鐑藉极閹间礁纾婚柣鎰惈閸ㄥ倿鏌ｉ姀鐘冲暈闁稿顑呴埞鎴︽偐閹绘帗娈銈嗘礋娴滃爼寮诲☉妯锋婵☆垰鍚嬮幉濂告⒑閸濆嫭濯奸柛鎾跺枛瀵鈽夐姀鈺傛櫇闂佹寧绻傚ú銊╂偩閻㈠憡鈷戦柛婵嗗閳ь剚鍨垮畷姗€鏁愰崱妯绘緫濠碉紕鍋戦崐鏍ь潖婵犳艾鐓曢柛顐犲劚绾惧潡骞栧ǎ顒€濡介柣鎾寸懄椤ㄣ儵鎮欓懠顑胯檸闂佽绻楃亸娆撳焵椤掑喚娼愭繛鍙夘焽閹广垽宕奸妷銉︽К闂侀潧顦弲娑橆啅濠靛洢浜滈柡宥冨妿閻倖淇? 闂傚倸鍊搁崐椋庣矆娓氣偓楠炴牠顢曢敂钘変罕闂佸憡鍔﹂崰鏍婵犳碍鐓欓柟瑙勫姦閸ゆ瑧绱?N 闂?
     # 闂傚倸鍊搁崐椋庣矆娓氣偓楠炲鏁撻悩鍐蹭簻濡炪倖甯掗崐缁樼▔瀹ュ鐓欓弶鍫濆⒔閻ｉ亶鏌涢妸銉モ偓褰掑Φ閸曨垰鍐€妞ゎ厽鍨靛▓濂告⒑缂佹ɑ鈷掗柛妯犲洦鍊剁€规洖娲犻崑鎾舵喆閸曨剛顦ュ┑鐐跺皺婵炩偓鐎规洘鍨块獮妯肩磼濡厧寮抽梺璇插嚱缂嶅棝宕楀鈧鎼佸冀椤撶啿鎷洪梻鍌氱墛缁嬫挾绮婚崘娴嬫斀妞ゆ梹鍎抽。鑲╃磼閸屾氨校缂佽桨绮欏畷銊︾節閸曨偄绠炲┑鐘殿暯濡插懘宕归幎钘夊偍鐟滄柨顕ｉ崨濠冨劅妞ゎ偒鍏涚花璇差渻閵堝棗濮х紒鑼跺Г閹便劌顓兼径瀣幍濡炪倖鐗楅懝楣冾敂椤撶喆浜滈柕蹇ョ磿閹冲洭鏌熼鐓庘挃濞寸媴绠撻幃鍓т沪閼测晝顦ㄩ梻鍌氬€搁崐鐑芥倿閿旈敮鍋撶粭娑樻噽閻瑩鏌熸潏楣冩闁搞倖鍔栭妵鍕冀閵娧冩殹闂佽偐澧楃€笛囧Φ閸曨喚鐤€闁圭偓娼欏▍锝囩磽娴ｇ顣抽柛瀣仱楠炲牓濡搁妷顔藉缓闂佺硶鍓濋〃鍛偓娑崇秮濮?tool_use 闂傚倸鍊搁崐椋庣矆娓氣偓楠炲鏁撻悩鍐叉疄闂佸憡鎸嗛崱妞ワ繝姊洪崗鑲┿偞闁哄懏绮撻敐鐐哄即閵忥紕鍘藉┑掳鍊愰崑鎾绘煟濡も偓濡稑鈻庨姀銈嗗€烽柣鎴烆焽閸樺崬鈹戞幊閸婃洟宕锝囶浄婵犲﹤鎳愮壕濂告煟濡櫣浠涢柡鍡╁墴閺屸€崇暆鐎ｎ剛鐦堥悗瑙勬礃鐢帡鈥﹂妸鈺佺妞ゆ劧绲块弳姘舵⒒閸屾瑦绁版い鏇熺墵瀹曟澘螖閸愩劌鐏婇梺瑙勫礃椤曆囧几娴ｈ　鍋撻獮鍨姎妞わ富鍨堕弻瀣炊閵娧呯槇闂傚倸鐗婄粙鎺椝夐悙鐑樼厱濠电姴鍊块崣鍕叏婵犲啯銇濇鐐寸墵閹瑩骞撻幒婵堚偓铏繆閻愵亜鈧牠宕归棃娴㈡椽濡堕崼顫綍婵犵數鍋為幐濠氬春閸愵喖纾婚柟鍓х帛閻撴瑦銇勯弮鍥舵綈婵炲懎娲弻鐔风暋闁箑鍓堕悗瑙勬礈閸忔﹢銆佸鈧幃鈺呮濞戞艾鈧偤姊?"YES." 缂傚倸鍊搁崐鎼佸磹閹间礁纾归柣鎴ｅГ閸婂潡鏌ㄩ弴鐐测偓鍝ョ不娴煎瓨鍋ｉ柛銉戝嫧鏋欓梺缁樺笩婵倝濡甸崟顖氱疀闁割偅娲橀宥夋⒑?
@@ -482,7 +524,8 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, 
             ),
             None,
         )
-    if latest_user:
+    latest_is_tool_result = _latest_message_is_tool_result(messages, client_profile) if tools else False
+    if latest_user and not latest_is_tool_result:
         latest_text = _extract_user_text_only(latest_user.get("content", ""), client_profile=client_profile).strip()
         if latest_text:
             latest_budget = max(900, budget - used - len("Human (CURRENT TASK - TOP PRIORITY): ") - 2)
@@ -566,6 +609,9 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, 
     state_notice = _build_state_followup_notice(messages, tools, client_profile)
     if state_notice:
         parts.append(state_notice)
+    tool_result_notice = _build_tool_result_followup_notice(messages, tools, client_profile)
+    if tool_result_notice:
+        parts.append(tool_result_notice)
 
     parts.append("Assistant:")
     prompt = "\n\n".join(parts)

@@ -147,7 +147,7 @@ async def run_retryable_completion_bridge(
 
         usage = calculate_usage(current_prompt, execution.state.answer_text)
         usage_delta = usage_delta_factory(execution, current_prompt) if usage_delta_factory is not None else usage["total_tokens"]
-        directive = build_tool_directive(standard_request, execution.state)
+        directive = build_tool_directive(standard_request, execution.state, history_messages=history_messages)
         await add_used_tokens(users_db, token, usage_delta)
         await cleanup_runtime_resources(
             client,

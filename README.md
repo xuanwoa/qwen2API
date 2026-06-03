@@ -1,5 +1,9 @@
 # qwen2API Enterprise Gateway
 
+## 加入群聊
+
+Telegram 群聊: [https://t.me/qwen2api](https://t.me/qwen2api)
+
 [![Stars](https://img.shields.io/github/stars/YuJunZhiXue/qwen2API?style=flat-square)](https://github.com/YuJunZhiXue/qwen2API/stargazers)
 [![Forks](https://img.shields.io/github/forks/YuJunZhiXue/qwen2API?style=flat-square)](https://github.com/YuJunZhiXue/qwen2API/network/members)
 [![Release](https://img.shields.io/github/v/release/YuJunZhiXue/qwen2API?style=flat-square)](https://github.com/YuJunZhiXue/qwen2API/releases)

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, StandardRequest
+from backend.runtime.execution import tool_directive_visible_text
 from backend.services.prompt_builder import _extract_text, _extract_user_text_only, _render_history_tool_call
 
 log = logging.getLogger("qwen2api.task_session")
@@ -337,8 +338,9 @@ def build_anthropic_assistant_history_message(*, execution, request: StandardReq
         if block.get('type') == 'thinking':
             continue
         content_blocks.append(block)
-    if directive.stop_reason != 'tool_use' and execution.state.answer_text and not content_blocks:
-        content_blocks.append({"type": "text", "text": execution.state.answer_text})
+    visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
+    if directive.stop_reason != 'tool_use' and visible_text and not content_blocks:
+        content_blocks.append({"type": "text", "text": visible_text})
     return {"role": "assistant", "content": content_blocks}
 
 
@@ -358,7 +360,7 @@ def build_openai_assistant_history_message(*, execution, request: StandardReques
             if block.get('type') == 'tool_use'
         ]
         return {'role': 'assistant', 'content': None, 'tool_calls': tool_calls}
-    return {'role': 'assistant', 'content': execution.state.answer_text}
+    return {'role': 'assistant', 'content': tool_directive_visible_text(directive, execution.state.answer_text)}
 
 
 def extend_hashes_with_assistant(*, current_hashes: list[str], assistant_message: dict[str, Any], request: StandardRequest) -> list[str]:

@@ -8,6 +8,7 @@ import httpx
 
 from backend.core.account_pool import AccountPool
 from backend.core.config import settings
+from backend.core.request_trace import trace_context_fields
 from backend.services.auth_resolver import BASE_URL, AuthResolver
 from backend.upstream.payload_builder import build_chat_payload
 from backend.upstream.qwen_executor import QwenExecutor
@@ -21,6 +22,9 @@ class QwenClient:
         self.account_pool = account_pool
         self.auth_resolver = AuthResolver(account_pool) if account_pool is not None else None
         self.executor = QwenExecutor(self, account_pool)
+        self._deleted_chat_ids: set[str] = set()
+        self._deleting_chat_ids: dict[str, asyncio.Future[bool]] = {}
+        self._delete_lock = asyncio.Lock()
 
         # HTTP连接池配置（对齐 ds2api 的高性能设置）
         limits = httpx.Limits(
@@ -92,29 +96,97 @@ class QwenClient:
         """Best-effort chat deletion with bounded retries."""
         if not token or not chat_id:
             return True
+        trace = trace_context_fields()
+        delete_future: asyncio.Future[bool] | None = None
+        owns_delete = False
+        async with self._delete_lock:
+            if chat_id in self._deleted_chat_ids:
+                log.info(
+                    "[DeleteChat] skip_duplicate chat_id=%s source=%s surface=%s req_id=%s marker=%s context_chat_id=%s",
+                    chat_id,
+                    source,
+                    trace["surface"],
+                    trace["req_id"],
+                    trace["marker"],
+                    trace["chat_id"],
+                )
+                return True
+            delete_future = self._deleting_chat_ids.get(chat_id)
+            if delete_future is None:
+                delete_future = asyncio.get_running_loop().create_future()
+                self._deleting_chat_ids[chat_id] = delete_future
+                owns_delete = True
+            else:
+                log.info(
+                    "[DeleteChat] skip_inflight chat_id=%s source=%s surface=%s req_id=%s marker=%s context_chat_id=%s",
+                    chat_id,
+                    source,
+                    trace["surface"],
+                    trace["req_id"],
+                    trace["marker"],
+                    trace["chat_id"],
+                )
+        if not owns_delete:
+            return await asyncio.shield(delete_future)
+
         max_attempts = max(1, int(attempts or settings.CHAT_DELETE_RETRY_ATTEMPTS))
         delay = max(0.0, float(base_delay if base_delay is not None else settings.CHAT_DELETE_RETRY_DELAY_SECONDS))
         last_error: Exception | None = None
-        for attempt in range(1, max_attempts + 1):
-            try:
-                await self.delete_chat(token, chat_id)
-                log.debug("[DeleteChat] deleted chat_id=%s source=%s attempt=%s", chat_id, source, attempt)
-                return True
-            except Exception as exc:
-                last_error = exc
-                if attempt >= max_attempts:
-                    break
-                log.warning(
-                    "[DeleteChat] retry chat_id=%s source=%s attempt=%s/%s error=%s",
-                    chat_id,
-                    source,
-                    attempt,
-                    max_attempts,
-                    exc,
-                )
-                await asyncio.sleep(delay * attempt)
-        log.warning("[DeleteChat] failed chat_id=%s source=%s error=%s", chat_id, source, last_error)
-        return False
+        deleted = False
+        try:
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    await self.delete_chat(token, chat_id)
+                    deleted = True
+                    async with self._delete_lock:
+                        self._deleted_chat_ids.add(chat_id)
+                        if len(self._deleted_chat_ids) > 5000:
+                            self._deleted_chat_ids.clear()
+                            self._deleted_chat_ids.add(chat_id)
+                    log.info(
+                        "[DeleteChat] deleted chat_id=%s source=%s attempt=%s surface=%s req_id=%s marker=%s context_chat_id=%s",
+                        chat_id,
+                        source,
+                        attempt,
+                        trace["surface"],
+                        trace["req_id"],
+                        trace["marker"],
+                        trace["chat_id"],
+                    )
+                    return True
+                except Exception as exc:
+                    last_error = exc
+                    if attempt >= max_attempts:
+                        break
+                    log.warning(
+                        "[DeleteChat] retry chat_id=%s source=%s attempt=%s/%s surface=%s req_id=%s marker=%s error=%s",
+                        chat_id,
+                        source,
+                        attempt,
+                        max_attempts,
+                        trace["surface"],
+                        trace["req_id"],
+                        trace["marker"],
+                        exc,
+                    )
+                    await asyncio.sleep(delay * attempt)
+            log.warning(
+                "[DeleteChat] failed chat_id=%s source=%s surface=%s req_id=%s marker=%s error=%s",
+                chat_id,
+                source,
+                trace["surface"],
+                trace["req_id"],
+                trace["marker"],
+                last_error,
+            )
+            return False
+        finally:
+            async with self._delete_lock:
+                current_future = self._deleting_chat_ids.get(chat_id)
+                if current_future is delete_future:
+                    if not delete_future.done():
+                        delete_future.set_result(deleted)
+                    self._deleting_chat_ids.pop(chat_id, None)
 
     async def list_chats(self, token: str, limit: int = 50) -> list[dict]:
         res = await self._request_json("GET", f"/api/v2/chats?limit={limit}", token, timeout=20.0)

@@ -12,7 +12,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from backend.adapter.standard_request import StandardRequest
 from backend.core.request_logging import new_request_id, request_context, update_request_context
-from backend.runtime.execution import build_tool_directive, build_usage_delta_factory, request_max_attempts
+from backend.core.request_trace import log_test_prompt, prompt_tail
+from backend.runtime.execution import build_tool_directive, build_usage_delta_factory, request_max_attempts, tool_directive_visible_text
 from backend.services.attachment_preprocessor import preprocess_attachments
 from backend.services.auth_quota import resolve_auth_context
 from backend.services.client_profiles import detect_openai_client_profile
@@ -429,11 +430,21 @@ def _tool_argument_event_names(item_type: str) -> tuple[str, str] | None:
     return None
 
 
-def build_responses_payload(*, response_id: str, created: int, model_name: str, prompt: str, execution, standard_request: StandardRequest) -> dict[str, Any]:
-    directive = build_tool_directive(standard_request, execution.state)
+def build_responses_payload(
+    *,
+    response_id: str,
+    created: int,
+    model_name: str,
+    prompt: str,
+    execution,
+    standard_request: StandardRequest,
+    directive=None,
+) -> dict[str, Any]:
+    directive = directive or build_tool_directive(standard_request, execution.state)
+    visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
     payload = _response_base(response_id=response_id, created=created, model_name=model_name)
     payload["status"] = "completed"
-    payload["usage"] = _response_usage(prompt, execution.state.answer_text)
+    payload["usage"] = _response_usage(prompt, visible_text)
 
     if directive.stop_reason == "tool_use":
         payload["output"] = [
@@ -443,7 +454,7 @@ def build_responses_payload(*, response_id: str, created: int, model_name: str, 
         ]
         payload["output_text"] = ""
     else:
-        output_text = execution.state.answer_text or ""
+        output_text = visible_text
         content: list[dict[str, Any]] = []
         if execution.state.reasoning_text:
             content.append({"type": "reasoning_text", "text": execution.state.reasoning_text})
@@ -585,7 +596,10 @@ class ResponsesStreamTranslator:
 
     def finalize(self, execution, directive) -> list[str]:
         chunks = self.drain_pending()
-        final_text = execution.state.answer_text or "".join(self.answer_fragments)
+        final_text = tool_directive_visible_text(
+            directive,
+            execution.state.answer_text or "".join(self.answer_fragments),
+        )
 
         if directive.stop_reason == "tool_use" and not self.tool_calls_emitted:
             tool_calls = [
@@ -606,7 +620,21 @@ class ResponsesStreamTranslator:
                     "content_index": self.content_index,
                     "delta": final_text,
                 }))
+                self.answer_fragments.append(final_text)
             chunks.extend(self.drain_pending())
+        elif directive.stop_reason != "tool_use":
+            streamed_text = "".join(self.answer_fragments)
+            if final_text.startswith(streamed_text):
+                missing_tail = final_text[len(streamed_text):]
+                if missing_tail:
+                    chunks.append(_sse("response.output_text.delta", {
+                        "response_id": self.response_id,
+                        "item_id": self.message_id,
+                        "output_index": self.output_index,
+                        "content_index": self.content_index,
+                        "delta": missing_tail,
+                    }))
+                    self.answer_fragments.append(missing_tail)
 
         if self.started_text:
             chunks.append(_sse("response.output_text.done", {
@@ -642,6 +670,7 @@ class ResponsesStreamTranslator:
             prompt=self.prompt,
             execution=execution,
             standard_request=self.standard_request,
+            directive=directive,
         )
         chunks.append(_sse("response.completed", {"response": final_response}))
         chunks.append("data: [DONE]\n\n")
@@ -737,6 +766,14 @@ async def responses_create(request: Request):
     created = int(time.time())
 
     with request_context(req_id=new_request_id(), surface="responses", requested_model=model_name, resolved_model=qwen_model):
+        test_markers = log_test_prompt(
+            log,
+            surface="responses",
+            model=qwen_model,
+            stream=standard_request.stream,
+            tools=[tool.get("name") for tool in standard_request.tools],
+            prompt=prompt,
+        )
         log.info(
             "[Responses] model=%s stream=%s tool_enabled=%s profile=%s tools=%s prompt_len=%s prompt_tail=%r",
             qwen_model,
@@ -745,7 +782,7 @@ async def responses_create(request: Request):
             standard_request.client_profile,
             [tool.get("name") for tool in standard_request.tools],
             len(prompt),
-            prompt[-500:],
+            prompt_tail(prompt),
         )
 
         if standard_request.stream:
@@ -787,7 +824,7 @@ async def responses_create(request: Request):
                                 on_delta=on_delta,
                             )
                             execution = result.execution
-                            directive = result.directive or build_tool_directive(standard_request, execution.state)
+                            directive = result.directive or build_tool_directive(standard_request, execution.state, history_messages=history_messages)
                             assistant_message = build_openai_assistant_history_message(
                                 execution=execution,
                                 request=standard_request,
@@ -860,7 +897,7 @@ async def responses_create(request: Request):
                     allow_after_visible_output=True,
                 )
                 execution = result.execution
-                directive = result.directive or build_tool_directive(standard_request, execution.state)
+                directive = result.directive or build_tool_directive(standard_request, execution.state, history_messages=history_messages)
                 assistant_message = build_openai_assistant_history_message(
                     execution=execution,
                     request=standard_request,
@@ -880,6 +917,7 @@ async def responses_create(request: Request):
                     prompt=result.prompt,
                     execution=execution,
                     standard_request=standard_request,
+                    directive=directive,
                 ))
         except Exception as e:
             await clear_invalidated_session_chat(app=app, request=standard_request)

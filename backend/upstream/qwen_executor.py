@@ -5,11 +5,53 @@ import time
 
 from backend.core.config import settings
 from backend.core.request_logging import update_request_context
+from backend.core.request_trace import find_test_markers, prompt_tail
 from backend.services.auth_resolver import AuthResolver
 from backend.upstream.payload_builder import build_chat_payload
 from backend.upstream.sse_consumer import parse_sse_chunk
 
 log = logging.getLogger("qwen2api.executor")
+
+
+def _format_upstream_error(obj: dict) -> str | None:
+    if not isinstance(obj, dict):
+        return None
+
+    request_id = obj.get("request_id") or obj.get("response_id") or "-"
+    if obj.get("success") is False:
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        code = data.get("code") or obj.get("code") or "upstream_error"
+        details = data.get("details") or data.get("message") or obj.get("details") or obj.get("message") or ""
+        return f"Qwen upstream error code={code} request_id={request_id} details={details}"
+
+    error = obj.get("error")
+    if isinstance(error, dict):
+        code = error.get("code") or "upstream_error"
+        details = error.get("details") or error.get("message") or error.get("type") or ""
+        return f"Qwen upstream error code={code} request_id={request_id} details={details}"
+    if isinstance(error, str) and error:
+        return f"Qwen upstream error request_id={request_id} details={error}"
+    return None
+
+
+def _extract_upstream_error(text: str) -> str | None:
+    """Find explicit upstream JSON errors in plain JSON or SSE chunks."""
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line or line == "[DONE]" or not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        message = _format_upstream_error(obj)
+        if message:
+            return message
+    return None
 
 
 class QwenExecutor:
@@ -148,6 +190,16 @@ class QwenExecutor:
         feature_config = payload.get("messages", [{}])[0].get("feature_config", {})
         prompt_len = len(content)
         log.info(f"[上游] 开始流式 会话={chat_id} 模型={model} 自定义工具={has_custom_tools} prompt长度={prompt_len} ({prompt_len/1024:.1f}KB)")
+        test_markers = find_test_markers(content)
+        if test_markers or settings.TRACE_RESPONSE_FINGERPRINTS:
+            log.info(
+                "[UpstreamPrompt] marker=%s chat_id=%s model=%s prompt_len=%s prompt_tail=%r",
+                ",".join(test_markers) if test_markers else "-",
+                chat_id,
+                model,
+                prompt_len,
+                prompt_tail(content),
+            )
         log.info(f"[上游] 功能配置: thinking_enabled={feature_config.get('thinking_enabled')} auto_thinking={feature_config.get('auto_thinking')} thinking_mode={feature_config.get('thinking_mode')} function_calling={feature_config.get('function_calling')} auto_search={feature_config.get('auto_search')} code_interpreter={feature_config.get('code_interpreter')} plugins_enabled={feature_config.get('plugins_enabled')} image_size={feature_config.get('image_size')} image_ratio={feature_config.get('image_ratio')}")
 
         prompt_content = payload.get("messages", [{}])[0].get("content", "")
@@ -178,6 +230,9 @@ class QwenExecutor:
                     raw_tail = (raw_tail + chunk_result["chunk"])[-500:]
                     while "\n\n" in buffer:
                         msg, buffer = buffer.split("\n\n", 1)
+                        upstream_error = _extract_upstream_error(msg)
+                        if upstream_error:
+                            raise Exception(upstream_error)
                         for evt in parse_sse_chunk(msg):
                             parsed_event_count += 1
                             if not first_event_logged:
@@ -197,6 +252,9 @@ class QwenExecutor:
             raise
 
         if buffer:
+            upstream_error = _extract_upstream_error(buffer)
+            if upstream_error:
+                raise Exception(upstream_error)
             for evt in parse_sse_chunk(buffer):
                 parsed_event_count += 1
                 if not first_event_logged:
@@ -214,6 +272,9 @@ class QwenExecutor:
 
         log.info(f"[上游] 流结束 会话={chat_id} 总耗时={elapsed:.3f}s 流字节={total_output_chars}")
         if parsed_event_count == 0:
+            upstream_error = _extract_upstream_error(raw_tail)
+            if upstream_error:
+                raise Exception(upstream_error)
             log.warning(
                 "[上游] SSE 未解析到有效 delta 会话=%s 流字节=%s raw_tail=%r",
                 chat_id,
@@ -237,6 +298,7 @@ class QwenExecutor:
         enable_search: bool = False,
     ):
         exclude = set()
+        last_error_message: str | None = None
         if fixed_account is not None:
             update_request_context(upstream_attempt=1)
             acc = fixed_account
@@ -324,6 +386,7 @@ class QwenExecutor:
                         self.account_pool.release(acc)
                     raise
                 err_msg = str(e).lower()
+                last_error_message = str(e)
                 is_timeout = (
                     "timeout" in err_msg
                     or "timed out" in err_msg
@@ -352,4 +415,6 @@ class QwenExecutor:
                     f"[上游] 重试 第{attempt + 1}/{settings.MAX_RETRIES}次 账号={acc.email} 错误={e}"
                 )
 
+        if last_error_message:
+            raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Last error: {last_error_message}")
         raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")

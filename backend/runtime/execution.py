@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -10,6 +11,7 @@ from typing import Any, Awaitable, Callable
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, StandardRequest
 from backend.core.config import settings
 from backend.core.request_logging import update_request_context
+from backend.core.request_trace import find_test_markers, log_test_prompt
 from backend.runtime.stream_metrics import StreamMetrics
 from backend.services import tool_parser
 from backend.services.workspace_context import build_workspace_final_reminder
@@ -87,6 +89,24 @@ def has_textual_tool_marker(text: str) -> bool:
     return any(marker in lowered for marker in TEXTUAL_TOOL_MARKERS)
 
 
+def tool_directive_visible_text(directive: "RuntimeToolDirective", fallback_text: str = "") -> str:
+    """Return safe visible text for non-tool responses, preferring filtered text blocks."""
+    if directive.stop_reason == "tool_use":
+        return ""
+    text_parts: list[str] = []
+    saw_text_block = False
+    for block in directive.tool_blocks:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        saw_text_block = True
+        text = block.get("text")
+        if isinstance(text, str) and text:
+            text_parts.append(text)
+    if saw_text_block:
+        return "".join(text_parts)
+    return fallback_text or ""
+
+
 @dataclass(slots=True)
 class RuntimeAttemptState:
     answer_text: str = ""
@@ -118,6 +138,15 @@ class RuntimeRetryDirective:
     retry: bool
     next_prompt: str
     reason: str | None = None
+
+
+@dataclass(slots=True)
+class FinalDeliveryGap:
+    required_markers: list[str] = field(default_factory=list)
+    missing_artifact_markers: list[str] = field(default_factory=list)
+    final_phrase: str = ""
+    final_phrase_missing: bool = False
+    target_paths: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -201,6 +230,7 @@ __all__ = [
     "retryable_usage_delta",
     "should_force_finish_after_tool_use",
     "tool_identity",
+    "tool_directive_visible_text",
 ]
 
 
@@ -323,6 +353,198 @@ def _tool_input_path(tool_input: Any) -> str:
         return ""
     value = tool_input.get("file_path") or tool_input.get("path") or ""
     return str(value).strip() if value is not None else ""
+
+
+_WRITE_TOOL_NAMES = {"Write", "Edit", "NotebookEdit", "fs_put_file", "fs_patch_file", "notebook_patch", "WriteX", "EditX"}
+_WRITE_PATH_KEYS = ("file_path", "path", "target_file", "filename", "file", "notebook_path")
+_WRITE_SUCCESS_RE = re.compile(
+    r"file\s+(?:created|updated|written|saved|modified)\s+successfully|"
+    r"(?:created|updated|written|saved|modified)\s+successfully|"
+    r"successfully\s+(?:created|updated|wrote|written|saved|modified|applied)|"
+    r"(?:created|updated|wrote|written|saved|modified)\s+(?:the\s+)?file|"
+    r"file\s+has\s+been\s+(?:created|updated|written|saved|modified)|"
+    r"has\s+been\s+(?:created|updated|written|saved|modified)|"
+    r"changes?\s+(?:applied|saved)\s+successfully|"
+    r"wrote\s+\d+\s+bytes?|"
+    r"\u5199\u5165\u6210\u529f|\u66f4\u65b0\u6210\u529f|\u4fdd\u5b58\u6210\u529f|\u521b\u5efa\u6210\u529f|\u4fee\u6539\u6210\u529f|"
+    r"\u5df2\u5199\u5165|\u5df2\u66f4\u65b0|\u5df2\u4fdd\u5b58|\u5df2\u521b\u5efa|\u5df2\u4fee\u6539",
+    re.IGNORECASE,
+)
+_WRITE_ERROR_RE = re.compile(
+    r"\berror\b|\bfailed\b|\bfailure\b|exception|traceback|invalid|not found|"
+    r"incomplete|partial|truncated|timeout|timed out|cancel(?:led)?|aborted|interrupted|"
+    r"no changes? (?:made|applied)|unchanged|"
+    r"\u5931\u8d25|\u9519\u8bef|\u5f02\u5e38|\u672a\u5b8c\u6210|\u4e0d\u5b8c\u6574|\u90e8\u5206|\u622a\u65ad|\u8d85\u65f6|\u53d6\u6d88|\u4e2d\u65ad|\u672a\u66f4\u6539|\u65e0\u66f4\u6539",
+    re.IGNORECASE,
+)
+
+
+def _normalized_guard_path(path: str) -> str:
+    return re.sub(r"/+", "/", (path or "").replace("\\", "/").strip()).lower()
+
+
+def _write_target_path(tool_input: Any) -> str:
+    if not isinstance(tool_input, dict):
+        return ""
+    for key in _WRITE_PATH_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _stable_write_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _stable_write_payload(value[key])
+            for key in sorted(value)
+            if key not in _WRITE_PATH_KEYS
+        }
+    if isinstance(value, list):
+        return [_stable_write_payload(item) for item in value]
+    return value
+
+
+def _write_payload_signature(tool_input: Any) -> str:
+    if not isinstance(tool_input, dict):
+        return ""
+    payload = _stable_write_payload(tool_input)
+    if payload in ({}, [], "", None):
+        return ""
+    try:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return repr(payload)
+
+
+def _is_write_like_tool(tool_name: str) -> bool:
+    return tool_name in _WRITE_TOOL_NAMES
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                nested = part.get("content") if part.get("type") in {"tool_result", "function_call_output"} else part.get("text")
+                if nested is not None:
+                    parts.append(_content_text(nested))
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(text for text in parts if text)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _tool_result_success(part_or_message: dict[str, Any]) -> bool:
+    if part_or_message.get("is_error") is True:
+        return False
+    text = _content_text(part_or_message.get("content", ""))
+    if _WRITE_ERROR_RE.search(text):
+        return False
+    return bool(_WRITE_SUCCESS_RE.search(text))
+
+
+def _iter_assistant_tool_uses(message: dict[str, Any]) -> list[dict[str, Any]]:
+    uses: list[dict[str, Any]] = []
+    content = message.get("content", [])
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "tool_use":
+                uses.append(part)
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            fn = tool_call.get("function", {}) if isinstance(tool_call.get("function"), dict) else {}
+            raw_args = fn.get("arguments", "{}")
+            try:
+                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) and raw_args else raw_args
+            except (json.JSONDecodeError, ValueError):
+                parsed_args = {}
+            uses.append({
+                "type": "tool_use",
+                "id": tool_call.get("id"),
+                "name": fn.get("name", ""),
+                "input": parsed_args if isinstance(parsed_args, dict) else {},
+            })
+    return uses
+
+
+def _latest_successful_write_result_identity(messages: list[dict[str, Any]] | None) -> tuple[str, str]:
+    """Return path and write payload when the latest client input is a successful write result."""
+    if not messages:
+        return "", ""
+    write_identity_by_tool_id: dict[str, tuple[str, str]] = {}
+    latest_successful_path = ""
+    latest_successful_signature = ""
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            tool_uses = _iter_assistant_tool_uses(message)
+            if not tool_uses:
+                latest_successful_path = ""
+                latest_successful_signature = ""
+                continue
+            for tool_use in tool_uses:
+                tool_id = str(tool_use.get("id") or "")
+                tool_name = normalize_tool_name(str(tool_use.get("name", "")), _WRITE_TOOL_NAMES)
+                tool_input = tool_use.get("input", {})
+                target_path = _write_target_path(tool_input)
+                signature = _write_payload_signature(tool_input)
+                if tool_id and _is_write_like_tool(tool_name) and target_path and signature:
+                    write_identity_by_tool_id[tool_id] = (target_path, signature)
+            continue
+
+        if message.get("role") == "tool":
+            tool_call_id = str(message.get("tool_call_id") or "")
+            if tool_call_id in write_identity_by_tool_id:
+                target_path, signature = write_identity_by_tool_id[tool_call_id]
+                if _tool_result_success(message):
+                    latest_successful_path, latest_successful_signature = target_path, signature
+            continue
+
+        if message.get("role") != "user":
+            continue
+        content = message.get("content", [])
+        if isinstance(content, list):
+            saw_tool_result = False
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") not in {"tool_result", "function_call_output"}:
+                    continue
+                saw_tool_result = True
+                tool_use_id = str(part.get("tool_use_id") or part.get("call_id") or part.get("id") or "")
+                if tool_use_id in write_identity_by_tool_id:
+                    target_path, signature = write_identity_by_tool_id[tool_use_id]
+                    if _tool_result_success(part):
+                        latest_successful_path, latest_successful_signature = target_path, signature
+            if not saw_tool_result:
+                latest_successful_path = ""
+                latest_successful_signature = ""
+        elif isinstance(content, str) and content.strip():
+            latest_successful_path = ""
+            latest_successful_signature = ""
+
+    if latest_successful_path and latest_successful_signature:
+        return latest_successful_path, latest_successful_signature
+    return "", ""
+
+
+def _completed_write_visible_text(tool_call: dict[str, Any]) -> str:
+    tool_input = tool_call.get("input", {})
+    if isinstance(tool_input, dict):
+        for key in ("content", "new_string", "text"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    target_path = _write_target_path(tool_input)
+    return f"已完成写入：{target_path}" if target_path else "已完成。"
 
 
 def _add_unique(values: list[str], value: str) -> None:
@@ -477,6 +699,280 @@ def _latest_user_text(history_messages: list[dict[str, Any]] | None) -> str:
     return ""
 
 
+_FINAL_CHECKPOINT_RE = re.compile(r"\[[A-Z0-9_-]*CHECKPOINT[A-Z0-9_-]*\]")
+_FINAL_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9_:-]{5,}\b")
+_FINAL_PHRASE_TOKEN_PATTERN = r"([A-Z0-9][A-Z0-9_:-]{5,})"
+_DELIVERY_FILE_RE = re.compile(
+    r"[A-Za-z]:[\\/][^\s`\"'<>|]+?\.(?:md|txt|json|csv|html|log)"
+    r"|(?<![\w.-])[\w./\\-]+?\.(?:md|txt|json|csv|html|log)",
+    re.IGNORECASE,
+)
+_FINAL_PHRASE_PATTERNS = (
+    re.compile(
+        r"(?i:(?:last|final)\s+(?:line|sentence|reply|response).{0,80}?"
+        r"(?:must|should)\s+(?:be|end\s+(?:with|exactly\s+with)))\s*[:\uff1a]?\s*"
+        r"[`\"']?" + _FINAL_PHRASE_TOKEN_PATTERN + r"[`\"']?",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"(?:\u6700\u540e\u4e00(?:\u53e5|\u884c)|\u7ed3\u5c3e|\u6700\u7ec8\u56de\u7b54).{0,60}?"
+        r"(?:\u5fc5\u987b|\u8981|\u5e94\u8be5).{0,30}?"
+        r"(?:(?:\u662f|\u4e3a|\u4ee5|\u7528)|(?i:be|with))?\s*[:\uff1a]?\s*"
+        r"[`\"']?" + _FINAL_PHRASE_TOKEN_PATTERN + r"[`\"']?",
+        re.DOTALL,
+    ),
+)
+
+
+def _delivery_requirement_text(history_messages: list[dict[str, Any]] | None, current_prompt: str) -> str:
+    return _latest_user_text(history_messages) or current_prompt or ""
+
+
+def _normalize_final_phrase_candidate(candidate: str) -> str:
+    value = (candidate or "").strip().strip("`\"'")
+    value = value.rstrip(".,;:)\uff0c\u3002\uff1b\uff1a")
+    if not value:
+        return ""
+    if _DELIVERY_FILE_RE.fullmatch(value):
+        return ""
+    if re.search(r"\.(?:md|txt|json|csv|html|log)\Z", value, re.IGNORECASE):
+        return ""
+    if not _FINAL_TOKEN_RE.fullmatch(value):
+        return ""
+    return value
+
+
+def _extract_final_phrase(requirement_text: str) -> str:
+    if not requirement_text:
+        return ""
+    for pattern in _FINAL_PHRASE_PATTERNS:
+        match = pattern.search(requirement_text)
+        if match:
+            candidate = _normalize_final_phrase_candidate(match.group(1))
+            if candidate:
+                return candidate
+    final_context = re.search(
+        r"(?:last|final|\u6700\u540e|\u7ed3\u5c3e|\u6700\u7ec8).{0,120}",
+        requirement_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if final_context:
+        tokens = _FINAL_TOKEN_RE.findall(final_context.group(0))
+        for token in reversed(tokens):
+            candidate = _normalize_final_phrase_candidate(token)
+            if candidate:
+                return candidate
+    return ""
+
+
+def _extract_required_markers(requirement_text: str) -> list[str]:
+    markers: list[str] = []
+    for marker in _FINAL_CHECKPOINT_RE.findall(requirement_text or ""):
+        _add_unique(markers, marker)
+    return markers
+
+
+def _extract_delivery_target_paths(requirement_text: str) -> list[str]:
+    if not requirement_text:
+        return []
+    all_paths: list[str] = []
+    report_paths: list[str] = []
+    for match in _DELIVERY_FILE_RE.finditer(requirement_text):
+        value = match.group(0).strip().rstrip(".,;:)\uff0c\u3002\uff1b\uff1a")
+        lowered = value.lower()
+        _add_unique(all_paths, value)
+        context = requirement_text[max(0, match.start() - 80):match.start()]
+        if (
+            "report" in lowered
+            or "\u62a5\u544a" in context
+            or "\u8f93\u51fa\u7684\u6587\u4ef6" in context
+            or "\u62a5\u544a\u6587\u4ef6" in context
+        ):
+            _add_unique(report_paths, value)
+    return report_paths or all_paths
+
+
+def _path_basename(path: str) -> str:
+    return re.split(r"[\\/]+", path.strip())[-1].lower()
+
+
+def _path_matches_targets(path: str, target_paths: list[str]) -> bool:
+    if not target_paths:
+        return True
+    normalized_path = _normalized_guard_path(path)
+    basename = _path_basename(path)
+    for target in target_paths:
+        normalized_target = _normalized_guard_path(target)
+        if (
+            normalized_path == normalized_target
+            or normalized_path.endswith("/" + normalized_target)
+            or normalized_target.endswith("/" + normalized_path)
+            or (basename and basename == _path_basename(target))
+        ):
+            return True
+    return False
+
+
+def _write_body_text(tool_input: Any) -> str:
+    if not isinstance(tool_input, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("content", "new_string", "text"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value:
+            parts.append(value)
+    return "\n".join(parts)
+
+
+def _delivered_artifact_text(history_messages: list[dict[str, Any]] | None, target_paths: list[str]) -> str:
+    if not history_messages:
+        return ""
+    tool_path_by_id: dict[str, str] = {}
+    chunks: list[str] = []
+    for message in history_messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for tool_use in _iter_assistant_tool_uses(message):
+                tool_id = str(tool_use.get("id") or "")
+                tool_name = normalize_tool_name(str(tool_use.get("name", "")), _WRITE_TOOL_NAMES)
+                tool_input = tool_use.get("input", {})
+                target_path = _write_target_path(tool_input) or _tool_input_path(tool_input)
+                if tool_id and target_path:
+                    tool_path_by_id[tool_id] = target_path
+                if _is_write_like_tool(tool_name) and _path_matches_targets(target_path, target_paths):
+                    body = _write_body_text(tool_input)
+                    if body:
+                        chunks.append(body)
+            continue
+
+        if message.get("role") == "tool":
+            tool_call_id = str(message.get("tool_call_id") or "")
+            if _path_matches_targets(tool_path_by_id.get(tool_call_id, ""), target_paths):
+                text = _content_text(message.get("content", ""))
+                if text:
+                    chunks.append(text)
+            continue
+
+        if message.get("role") != "user":
+            continue
+        content = message.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") not in {"tool_result", "function_call_output"}:
+                continue
+            tool_id = str(part.get("tool_use_id") or part.get("call_id") or part.get("id") or "")
+            if _path_matches_targets(tool_path_by_id.get(tool_id, ""), target_paths):
+                text = _content_text(part.get("content", ""))
+                if text:
+                    chunks.append(text)
+    return "\n".join(chunks)
+
+
+def _final_delivery_gap(
+    *,
+    current_prompt: str,
+    history_messages: list[dict[str, Any]] | None,
+    state: RuntimeAttemptState,
+    has_tools: bool,
+) -> FinalDeliveryGap | None:
+    requirement_text = _delivery_requirement_text(history_messages, current_prompt)
+    required_markers = _extract_required_markers(requirement_text)
+    final_phrase = _extract_final_phrase(requirement_text)
+    if not required_markers and not final_phrase:
+        return None
+
+    target_paths = _extract_delivery_target_paths(requirement_text)
+    artifact_text = _delivered_artifact_text(history_messages, target_paths)
+    visible_answer = state.answer_text or ""
+    marker_source = artifact_text if target_paths and has_tools else "\n".join(part for part in (artifact_text, visible_answer) if part)
+    missing_markers = [
+        marker for marker in required_markers
+        if marker not in marker_source
+    ]
+    final_phrase_missing = bool(final_phrase and not visible_answer.rstrip().endswith(final_phrase))
+    if not missing_markers and not final_phrase_missing:
+        return None
+    return FinalDeliveryGap(
+        required_markers=required_markers,
+        missing_artifact_markers=missing_markers,
+        final_phrase=final_phrase,
+        final_phrase_missing=final_phrase_missing,
+        target_paths=target_paths,
+    )
+
+
+def _final_delivery_retry_message(gap: FinalDeliveryGap) -> str:
+    lines = [
+        "[MANDATORY FINAL DELIVERY CHECK FAILED]",
+        "The previous response tried to finish, but explicit user delivery requirements are still missing.",
+    ]
+    if gap.target_paths:
+        lines.append("Target report/file path(s): " + ", ".join(gap.target_paths[-4:]))
+    if gap.required_markers:
+        lines.append("Required marker(s): " + ", ".join(gap.required_markers))
+    if gap.missing_artifact_markers:
+        lines.append("Missing from delivered artifact/output: " + ", ".join(gap.missing_artifact_markers))
+        lines.append("Use Write/Edit only if the report/file needs these missing markers. Do not repeat an identical Write/Edit payload.")
+    if gap.final_phrase_missing and gap.final_phrase:
+        lines.append(f"The final visible response must end exactly with: {gap.final_phrase}")
+    lines.append("Do not restart the task. Complete only the missing delivery items, then finish.")
+    lines.append("[/MANDATORY FINAL DELIVERY CHECK FAILED]")
+    return "\n".join(lines)
+
+
+def _append_final_phrase_to_answer(state: RuntimeAttemptState, final_phrase: str) -> bool:
+    if not final_phrase:
+        return False
+    current = state.answer_text or ""
+    if current.rstrip().endswith(final_phrase):
+        return False
+    trimmed = current.rstrip()
+    state.answer_text = f"{trimmed}\n{final_phrase}" if trimmed else final_phrase
+    return True
+
+
+def _delivery_guard_prompt(request: StandardRequest, current_prompt: str | None = None) -> str:
+    return current_prompt or getattr(request, "prompt", "") or getattr(request, "full_prompt", "") or ""
+
+
+def _complete_final_delivery_if_safe(
+    *,
+    request: StandardRequest,
+    state: RuntimeAttemptState,
+    history_messages: list[dict[str, Any]] | None,
+    current_prompt: str | None = None,
+    source: str,
+) -> FinalDeliveryGap | None:
+    gap = _final_delivery_gap(
+        current_prompt=_delivery_guard_prompt(request, current_prompt),
+        history_messages=history_messages,
+        state=state,
+        has_tools=bool(request.tools),
+    )
+    if gap is None:
+        return None
+    if gap.missing_artifact_markers:
+        log.warning(
+            "[FinalDeliveryGuard] source=%s incomplete missing_markers=%s final_phrase_missing=%s targets=%s",
+            source,
+            gap.missing_artifact_markers,
+            gap.final_phrase_missing,
+            gap.target_paths[-4:],
+        )
+        return gap
+    if gap.final_phrase_missing and gap.final_phrase:
+        if _append_final_phrase_to_answer(state, gap.final_phrase):
+            log.warning(
+                "[FinalDeliveryGuard] source=%s appended final phrase before end_turn phrase=%s targets=%s",
+                source,
+                gap.final_phrase,
+                gap.target_paths[-4:],
+            )
+    return gap
+
+
 
 def _user_negated_control_tool(tool_name: str, latest: str) -> bool:
     if not latest:
@@ -623,6 +1119,8 @@ def _tool_call_block_reason(
     tool_call: dict[str, Any],
     request: StandardRequest,
     history_messages: list[dict[str, Any]] | None = None,
+    *,
+    include_completed_write_guard: bool = False,
 ) -> str | None:
     raw_name = str(tool_call.get("name", ""))
     tool_name = normalize_tool_name(raw_name, request.tool_names)
@@ -631,6 +1129,19 @@ def _tool_call_block_reason(
         return f"disallowed_control_tool:{tool_name}"
     if _is_blocked_read_call(tool_name, tool_input, request):
         return f"blocked_read:{_tool_input_path(tool_input)}"
+    if include_completed_write_guard and _is_write_like_tool(tool_name):
+        latest_completed_path, latest_completed_signature = _latest_successful_write_result_identity(history_messages)
+        target_path = _write_target_path(tool_input)
+        current_signature = _write_payload_signature(tool_input)
+        if (
+            latest_completed_path
+            and latest_completed_signature
+            and target_path
+            and current_signature
+            and _normalized_guard_path(latest_completed_path) == _normalized_guard_path(target_path)
+            and latest_completed_signature == current_signature
+        ):
+            return f"completed_write:{target_path}"
     return None
 
 def _filter_invalid_native_tool_calls(
@@ -675,6 +1186,51 @@ def _tool_input_preview(input_data: Any, *, limit: int = 260) -> str:
     return raw[:limit] + ("...[truncated]" if len(raw) > limit else "")
 
 
+def _trace_text_fingerprint(label: str, text: str, *, stage: str, chat_id: str | None = None) -> None:
+    if not settings.TRACE_RESPONSE_FINGERPRINTS:
+        return
+    text = text or ""
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+    tail_chars = max(0, int(getattr(settings, "TRACE_RESPONSE_TAIL_CHARS", 160) or 0))
+    tail = text[-tail_chars:] if tail_chars else ""
+    log.info(
+        "[Trace] %s stage=%s chat_id=%s chars=%s sha256=%s tail=%r",
+        label,
+        stage,
+        chat_id or "-",
+        len(text),
+        digest,
+        tail,
+    )
+
+
+def _trace_tool_call_inputs(stage: str, tool_calls: list[dict[str, Any]]) -> None:
+    if not settings.TRACE_RESPONSE_FINGERPRINTS:
+        return
+    for idx, tool_call in enumerate(tool_calls, start=1):
+        if not isinstance(tool_call, dict):
+            continue
+        try:
+            raw_input = json.dumps(tool_call.get("input", {}), ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            raw_input = repr(tool_call.get("input", {}))
+        _trace_text_fingerprint(
+            f"tool_input index={idx} id={tool_call.get('id', '-')} name={tool_call.get('name', '-')}",
+            raw_input,
+            stage=stage,
+        )
+        input_data = tool_call.get("input", {})
+        if isinstance(input_data, dict):
+            for field_name in ("content", "new_string", "old_string", "command"):
+                field_value = input_data.get(field_name)
+                if isinstance(field_value, str):
+                    _trace_text_fingerprint(
+                        f"tool_input_field index={idx} id={tool_call.get('id', '-')} name={tool_call.get('name', '-')} field={field_name}",
+                        field_value,
+                        stage=stage,
+                    )
+
+
 def _log_tool_calls(stage: str, tool_calls: list[dict[str, Any]]) -> None:
     for idx, tool_call in enumerate(tool_calls, start=1):
         if not isinstance(tool_call, dict):
@@ -688,6 +1244,7 @@ def _log_tool_calls(stage: str, tool_calls: list[dict[str, Any]]) -> None:
             tool_call.get("name", "-"),
             _tool_input_preview(tool_call.get("input", {})),
         )
+    _trace_tool_call_inputs(stage, tool_calls)
 
 
 async def run_runtime_attempt(
@@ -913,6 +1470,9 @@ async def collect_completion_run(
                 len(reasoning_text),
                 final_finish_reason,
             )
+            _trace_text_fingerprint("upstream_answer", answer_text, stage=reason, chat_id=chat_id)
+            if reasoning_text:
+                _trace_text_fingerprint("upstream_reasoning", reasoning_text, stage=reason, chat_id=chat_id)
         if detected_tool_calls:
             _log_tool_calls(f"final:{reason or 'stream_end'}", detected_tool_calls)
         metrics.mark("stream_finish", float(len(raw_events)))
@@ -932,6 +1492,32 @@ async def collect_completion_run(
     request_chat_type = getattr(request, "chat_type", "t2t") or "t2t"
     use_prewarmed_chat = request_chat_type == "t2t" and not bool(getattr(request, "skip_prewarmed_chat_ids", False))
     existing_chat_id = getattr(request, "upstream_chat_id", None) if request_chat_type == "t2t" else None
+    update_request_context(
+        surface=getattr(request, "surface", "-"),
+        requested_model=getattr(request, "requested_model", None) or getattr(request, "response_model", "-"),
+        resolved_model=getattr(request, "resolved_model", "-"),
+    )
+    test_markers = log_test_prompt(
+        log,
+        stage="runtime_prompt",
+        surface=getattr(request, "surface", "-"),
+        model=getattr(request, "resolved_model", "-"),
+        stream=bool(getattr(request, "stream", False)),
+        tools=list(getattr(request, "tool_names", []) or []),
+        prompt=prompt,
+    )
+    delete_on_close = (request_chat_type != "t2t") or not bool(getattr(request, "persistent_session", False))
+    if test_markers or settings.TRACE_RESPONSE_FINGERPRINTS:
+        log.info(
+            "[RuntimePrompt] marker=%s surface=%s model=%s prompt_len=%s delete_on_close=%s persistent_session=%s existing_chat_id=%s",
+            ",".join(test_markers) if test_markers else "-",
+            getattr(request, "surface", "-"),
+            getattr(request, "resolved_model", "-"),
+            len(prompt or ""),
+            delete_on_close,
+            bool(getattr(request, "persistent_session", False)),
+            existing_chat_id or "-",
+        )
 
     async for item in client.chat_stream_events_with_retry(
         request.resolved_model,
@@ -940,7 +1526,7 @@ async def collect_completion_run(
         files=getattr(request, "upstream_files", None),
         fixed_account=getattr(request, "bound_account", None),
         existing_chat_id=existing_chat_id,
-        delete_on_close=(request_chat_type != "t2t") or not bool(getattr(request, "persistent_session", False)),
+        delete_on_close=delete_on_close,
         use_prewarmed=use_prewarmed_chat,
         chat_type=request_chat_type,
         thinking_enabled=getattr(request, "thinking_enabled", None),
@@ -950,6 +1536,16 @@ async def collect_completion_run(
             chat_id = item.get("chat_id")
             acc = item.get("acc")
             update_request_context(chat_id=chat_id)
+            test_markers = find_test_markers(prompt)
+            if test_markers:
+                log.info(
+                    "[TestTrace] stage=upstream_chat marker=%s upstream_chat_id=%s account=%s delete_on_close=%s surface=%s",
+                    ",".join(test_markers),
+                    chat_id,
+                    getattr(acc, "email", "-"),
+                    delete_on_close,
+                    getattr(request, "surface", "-"),
+                )
             metrics.mark("chat_created", float(len(raw_events)))
             continue
         if item.get("type") != "event":
@@ -1297,19 +1893,28 @@ def _filter_tool_directive(
         if not isinstance(block, dict) or block.get("type") != "tool_use":
             filtered_blocks.append(block)
             continue
-        reason = _tool_call_block_reason(block, request, history_messages)
+        reason = _tool_call_block_reason(
+            block,
+            request,
+            history_messages,
+            include_completed_write_guard=True,
+        )
         if reason:
             blocked_reasons.append(reason)
             log.warning("[ToolGuard] blocked final directive reason=%s name=%s", reason, block.get("name", "-"))
+            if reason.startswith("completed_write:"):
+                filtered_blocks.append({"type": "text", "text": _completed_write_visible_text(block)})
             continue
         filtered_blocks.append(block)
     if any(isinstance(block, dict) and block.get("type") == "tool_use" for block in filtered_blocks):
         return RuntimeToolDirective(tool_blocks=filtered_blocks, stop_reason="tool_use")
     if blocked_reasons:
+        if filtered_blocks:
+            return RuntimeToolDirective(tool_blocks=filtered_blocks, stop_reason="end_turn")
         return RuntimeToolDirective(
             tool_blocks=[{
                 "type": "text",
-                "text": "Blocked an invalid or disallowed tool call before sending it to the client. Retrying is required to continue the task safely.",
+                "text": "",
             }],
             stop_reason="end_turn",
         )
@@ -1320,6 +1925,13 @@ def build_tool_directive(
     state: RuntimeAttemptState,
     history_messages: list[dict[str, Any]] | None = None,
 ) -> RuntimeToolDirective:
+    if not state.tool_calls and state.finish_reason == "stop":
+        _complete_final_delivery_if_safe(
+            request=request,
+            state=state,
+            history_messages=history_messages,
+            source="directive",
+        )
     raw_directive = parse_tool_directive_once(request, state)
     directive = _filter_tool_directive(raw_directive, request, history_messages)
     log.info(
@@ -1405,23 +2017,52 @@ def evaluate_retry_directive(
     state: RuntimeAttemptState,
     allow_after_visible_output: bool = False,
 ) -> RuntimeRetryDirective:
-    if attempt_index >= max_attempts - 1:
-        return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason=None)
-
     can_retry_after_output = allow_after_visible_output or not state.emitted_visible_output
 
     def _retry(reason: str, next_prompt: str) -> RuntimeRetryDirective:
         log.info(
-            "[Retry] reason=%s attempt=%s/%s client=%s blocked=%s finish_reason=%s emitted=%s",
+            "[Retry] reason=%s attempt=%s/%s client=%s blocked=%s read_blocked=%s finish_reason=%s emitted=%s",
             reason,
             attempt_index + 1,
             max_attempts,
             getattr(request, "client_profile", "-"),
             getattr(request, "retry_blocked_tools", [])[:8],
+            getattr(request, "retry_read_blocklist", [])[-8:],
             state.finish_reason,
             state.emitted_visible_output,
         )
         return RuntimeRetryDirective(retry=True, next_prompt=next_prompt, reason=reason)
+
+    if not state.tool_calls and state.finish_reason == "stop" and can_retry_after_output:
+        delivery_gap = _complete_final_delivery_if_safe(
+            request=request,
+            state=state,
+            history_messages=history_messages,
+            current_prompt=current_prompt,
+            source="retry",
+        )
+        if delivery_gap is not None:
+            if (
+                not delivery_gap.missing_artifact_markers
+                and delivery_gap.final_phrase
+                and (delivery_gap.final_phrase_missing or state.answer_text.rstrip().endswith(delivery_gap.final_phrase))
+            ):
+                return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason="final_phrase_appended")
+            log.warning(
+                "[FinalDeliveryGuard] retry missing_markers=%s final_phrase_missing=%s targets=%s",
+                delivery_gap.missing_artifact_markers,
+                delivery_gap.final_phrase_missing,
+                delivery_gap.target_paths[-4:],
+            )
+            if attempt_index >= max_attempts - 1:
+                return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason="final_delivery_incomplete_exhausted")
+            return _retry(
+                "final_delivery_incomplete",
+                _inject_retry_guard(current_prompt, request, _final_delivery_retry_message(delivery_gap)),
+            )
+
+    if attempt_index >= max_attempts - 1:
+        return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason=None)
 
     if state.finish_reason == "invalid_tool_args" and request.tools and can_retry_after_output:
         attempted_tools = [
@@ -1432,6 +2073,45 @@ def evaluate_retry_directive(
         disallowed = [name for name in attempted_tools if _is_disallowed_control_tool(name, request, history_messages)]
         for name in disallowed:
             _add_unique(request.retry_blocked_tools, name)
+        blocked_read_paths: list[str] = []
+        previously_blocked_read_paths = {
+            path for path in getattr(request, "retry_read_blocklist", []) if path
+        }
+        repeated_blocked_read_paths: list[str] = []
+        for call in state.tool_calls:
+            if not isinstance(call, dict):
+                continue
+            tool_name = normalize_tool_name(str(call.get("name", "")), request.tool_names)
+            tool_input = call.get("input", {})
+            if tool_name != "Read":
+                continue
+            read_path = _tool_input_path(tool_input)
+            if not read_path:
+                continue
+            if read_path in previously_blocked_read_paths:
+                _add_unique(repeated_blocked_read_paths, read_path)
+            _add_unique(request.retry_read_blocklist, read_path)
+            _add_unique(blocked_read_paths, read_path)
+        if blocked_read_paths:
+            if len(repeated_blocked_read_paths) == len(blocked_read_paths):
+                log.warning(
+                    "[Retry] stop_repeated_blocked_read attempt=%s/%s paths=%s finish_reason=%s",
+                    attempt_index + 1,
+                    max_attempts,
+                    repeated_blocked_read_paths[-4:],
+                    state.finish_reason,
+                )
+                return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason="repeated_blocked_read")
+            joined_paths = "; ".join(blocked_read_paths[-4:])
+            force_text = (
+                "[MANDATORY]: The previous Read call was blocked because that file was already returned unchanged or is on the retry read blocklist. "
+                f"Do NOT call Read again for: {joined_paths}. "
+                "Use the existing result, choose another relevant tool, write/edit the requested output, or finish."
+            )
+            return _retry(
+                f"blocked_read:{blocked_read_paths[-1]}",
+                _inject_retry_guard(current_prompt, request, force_text),
+            )
         force_text = (
             "[MANDATORY]: The previous tool call was invalid, disallowed, or incomplete. "
             "Do NOT reuse or continue any partial QNML/tool markup from the previous response. "
@@ -1517,18 +2197,13 @@ def evaluate_retry_directive(
 
                 if tool_name == "Read" and has_recent_unchanged_read_result(history_messages, _tool_input_path(tool_input)):
                     read_path = _tool_input_path(tool_input)
-                    _add_unique(request.retry_read_blocklist, read_path)
-                    if can_retry_after_output:
-                        force_text = (
-                            "[MANDATORY]: You just received 'Unchanged since last read'. "
-                            f"Do NOT call Read again for this target{(': ' + read_path) if read_path else ''}. "
-                            "Use the existing result, choose another tool, write/edit the requested output, or finish."
-                        )
-                        return _retry(
-                            "unchanged_read_result",
-                            _inject_retry_guard(current_prompt, request, force_text),
-                        )
-                    log.warning("[Runtime] blocked repeated Read after unchanged result, but cannot retry")
+                    log.info(
+                        "[Retry] pass_through_unchanged_read path=%s attempt=%s/%s client=%s",
+                        read_path or "-",
+                        attempt_index + 1,
+                        max_attempts,
+                        getattr(request, "client_profile", "-"),
+                    )
 
                 if tool_name == "WebSearch" and has_recent_search_no_results(history_messages) and can_retry_after_output:
                     force_text = (

@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     CHAT_DELETE_RETRY_DELAY_SECONDS: float = float(os.getenv("CHAT_DELETE_RETRY_DELAY_SECONDS", 0.5))
     CHAT_ID_PREWARM_TARGET_PER_ACCOUNT: int = int(os.getenv("CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", 5))
     CHAT_ID_PREWARM_TTL_SECONDS: int = int(os.getenv("CHAT_ID_PREWARM_TTL_SECONDS", 120))
+    TRACE_RESPONSE_FINGERPRINTS: bool = os.getenv("TRACE_RESPONSE_FINGERPRINTS", "").strip().lower() in {"1", "true", "yes", "on"}
+    TRACE_RESPONSE_TAIL_CHARS: int = int(os.getenv("TRACE_RESPONSE_TAIL_CHARS", 160))
 
     # 日志
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

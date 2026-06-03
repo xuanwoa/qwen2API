@@ -9,6 +9,7 @@ from backend.adapter.standard_request import StandardRequest
 from backend.adapter.cli_proxy import CLIProxy
 from backend.core.config import resolve_model, settings
 from backend.core.request_logging import new_request_id, request_context, update_request_context
+from backend.core.request_trace import log_test_prompt, prompt_tail
 from backend.runtime import stream_presenter
 from backend.runtime.execution import (
     build_tool_directive,
@@ -17,6 +18,7 @@ from backend.runtime.execution import (
     collect_completion_run_with_recovery,
     evaluate_retry_directive,
     request_max_attempts,
+    tool_directive_visible_text,
 )
 from backend.services.auth_quota import resolve_auth_context
 from backend.services.completion_bridge import force_fresh_chat_after_empty_response, is_empty_upstream_response
@@ -69,6 +71,7 @@ class _AnthropicStreamState:
         self.prompt = prompt
         self.pending_chunks: list[str] = []
         self.answer_text_buffer: list[tuple[int, str]] = []
+        self.flushed_answer_text = ""
         self.block_index = 0
         self.current_block: dict[str, object] = {"type": None, "index": None, "tool_call_id": None}
         self.opened_tool_calls: set[str] = set()
@@ -142,10 +145,38 @@ class _AnthropicStreamState:
             self.pending_chunks.append(
                 stream_presenter.anthropic_content_block_delta(index, {"type": "text_delta", "text": text_chunk})
             )
+            self.flushed_answer_text += text_chunk
         self.answer_text_buffer = []
 
     def clear_answer_text(self) -> None:
         self.answer_text_buffer = []
+
+    def answer_text(self) -> str:
+        return "".join(text_chunk for _, text_chunk in self.answer_text_buffer)
+
+    def queued_answer_text(self) -> str:
+        return self.flushed_answer_text + self.answer_text()
+
+    def buffer_missing_answer_tail(self, final_text: str) -> None:
+        if not final_text:
+            return
+        queued = self.queued_answer_text()
+        if queued == final_text:
+            return
+        if final_text.startswith(queued):
+            missing = final_text[len(queued):]
+            if missing:
+                self.buffer_answer_text(missing)
+            return
+        if final_text.startswith(self.flushed_answer_text):
+            missing = final_text[len(self.flushed_answer_text):]
+            self.answer_text_buffer = []
+            if missing:
+                self.buffer_answer_text(missing)
+            return
+        if not self.flushed_answer_text:
+            self.answer_text_buffer = []
+            self.buffer_answer_text(final_text)
 
 
 def _build_standard_request(req_data: dict) -> StandardRequest:
@@ -196,7 +227,7 @@ def _visible_answer_text_length(*, directive, execution, stream_state: _Anthropi
     if directive.stop_reason == "tool_use":
         return 0
     if stream_state is not None:
-        return sum(len(text_chunk) for _, text_chunk in stream_state.answer_text_buffer)
+        return len(stream_state.queued_answer_text())
     return len(execution.state.answer_text)
 
 
@@ -319,8 +350,17 @@ async def anthropic_messages(request: Request):
                     standard_request, effective_payload, model_name, qwen_model, prompt, msg_id = await prepare_locked_request(req_data)
                     update_request_context(requested_model=model_name, resolved_model=qwen_model)
                     tool_names = [t.get('name') for t in standard_request.tools]
+                    log_test_prompt(
+                        log,
+                        stage="anthropic_request",
+                        surface="anthropic",
+                        model=qwen_model,
+                        stream=standard_request.stream,
+                        tools=tool_names,
+                        prompt=prompt,
+                    )
                     log.info(
-                        "[ANT] model=%s stream=%s tool_enabled=%s tools=%s mcp_tools=%s workspace=%s prompt_len=%s",
+                        "[ANT] model=%s stream=%s tool_enabled=%s tools=%s mcp_tools=%s workspace=%s prompt_len=%s prompt_tail=%r delete_expected=%s persistent_session=%s",
                         qwen_model,
                         standard_request.stream,
                         standard_request.tool_enabled,
@@ -328,6 +368,9 @@ async def anthropic_messages(request: Request):
                         [name for name in tool_names if isinstance(name, str) and name.startswith("mcp__")],
                         standard_request.workspace_root or "-",
                         len(prompt),
+                        prompt_tail(prompt),
+                        (getattr(standard_request, "chat_type", "t2t") != "t2t") or not bool(getattr(standard_request, "persistent_session", False)),
+                        bool(getattr(standard_request, "persistent_session", False)),
                     )
                     history_messages = original_history_messages
                     current_prompt = prompt
@@ -347,18 +390,11 @@ async def anthropic_messages(request: Request):
                                     stream_state.buffer_answer_text(text_chunk)
                                     return
                                 if phase == "tool_call":
-                                    extra = evt.get("extra", {}) or {}
-                                    tool_call_id = extra.get("tool_call_id")
-                                    if tool_call_id is None:
-                                        tool_call_id = f"tc_idx_{extra.get('index', 0)}"
-                                    tool_name = extra.get("tool_name")
-                                    if not tool_name:
-                                        return
-                                    stream_state.append_tool_delta(
-                                        tool_call_id=str(tool_call_id),
-                                        tool_name=str(tool_name),
-                                        partial_json=evt.get("content", ""),
-                                    )
+                                    # Buffering means no SSE chunk is sent until the
+                                    # final directive is built. Emit tool blocks only
+                                    # after ToolGuard has had a chance to suppress
+                                    # redundant completed tool calls.
+                                    return
 
                             execution = await collect_completion_run_with_recovery(
                                 client,
@@ -411,15 +447,18 @@ async def anthropic_messages(request: Request):
                                 stream_state.pending_chunks.append(_message_start_event(msg_id, model_name, current_prompt, execution.state.answer_text))
 
                             directive = build_tool_directive(standard_request, execution.state, history_messages=history_messages)
+                            visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
+                            if directive.stop_reason != "tool_use":
+                                stream_state.buffer_missing_answer_tail(visible_text)
                             if (
                                 directive.stop_reason != "tool_use"
                                 and not stream_state.answer_text_buffer
-                                and execution.state.answer_text
+                                and visible_text
                             ):
                                 # ToolSieve may hold short normal replies until stream end to
                                 # avoid leaking partial tool markup. If no live text delta was
                                 # emitted, replay the finalized visible answer here.
-                                stream_state.buffer_answer_text(execution.state.answer_text)
+                                stream_state.buffer_answer_text(visible_text)
                             visible_answer_length = _visible_answer_text_length(
                                 directive=directive,
                                 execution=execution,
@@ -501,8 +540,17 @@ async def anthropic_messages(request: Request):
             standard_request, effective_payload, model_name, qwen_model, prompt, msg_id = await prepare_locked_request(req_data)
             update_request_context(requested_model=model_name, resolved_model=qwen_model)
             tool_names = [t.get('name') for t in standard_request.tools]
+            log_test_prompt(
+                log,
+                stage="anthropic_request",
+                surface="anthropic",
+                model=qwen_model,
+                stream=standard_request.stream,
+                tools=tool_names,
+                prompt=prompt,
+            )
             log.info(
-                "[ANT] model=%s stream=%s tool_enabled=%s tools=%s mcp_tools=%s workspace=%s prompt_len=%s",
+                "[ANT] model=%s stream=%s tool_enabled=%s tools=%s mcp_tools=%s workspace=%s prompt_len=%s prompt_tail=%r delete_expected=%s persistent_session=%s",
                 qwen_model,
                 standard_request.stream,
                 standard_request.tool_enabled,
@@ -510,6 +558,9 @@ async def anthropic_messages(request: Request):
                 [name for name in tool_names if isinstance(name, str) and name.startswith("mcp__")],
                 standard_request.workspace_root or "-",
                 len(prompt),
+                prompt_tail(prompt),
+                (getattr(standard_request, "chat_type", "t2t") != "t2t") or not bool(getattr(standard_request, "persistent_session", False)),
+                bool(getattr(standard_request, "persistent_session", False)),
             )
             history_messages = original_history_messages
             current_prompt = prompt
@@ -552,17 +603,24 @@ async def anthropic_messages(request: Request):
                         raise RuntimeError("empty upstream response after retries")
 
                     directive = build_tool_directive(standard_request, execution.state, history_messages=history_messages)
+                    visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
                     _log_response_tool_blocks("json_response", directive.tool_blocks)
                     content_blocks: list[dict] = []
                     if execution.state.reasoning_text:
                         content_blocks.append({"type": "thinking", "thinking": execution.state.reasoning_text})
                     content_blocks.extend(directive.tool_blocks)
+                    if (
+                        directive.stop_reason != "tool_use"
+                        and visible_text
+                        and not any(block.get("type") == "text" for block in content_blocks)
+                    ):
+                        content_blocks.append({"type": "text", "text": visible_text})
 
                     await _add_used_tokens_for_prompt(
                         users_db=users_db,
                         token=token,
                         prompt_text=current_prompt,
-                        answer_text_length=len(execution.state.answer_text),
+                        answer_text_length=len(visible_text),
                     )
                     assistant_message = build_anthropic_assistant_history_message(
                         execution=execution,
@@ -592,7 +650,7 @@ async def anthropic_messages(request: Request):
                             "content": content_blocks,
                             "stop_reason": directive.stop_reason,
                             "stop_sequence": None,
-                            "usage": _anthropic_usage(current_prompt, execution.state.answer_text),
+                            "usage": _anthropic_usage(current_prompt, visible_text),
                         }
                     )
                 except Exception as e:
