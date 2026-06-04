@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from backend.runtime.execution import RuntimeToolDirective, build_tool_directive, tool_directive_visible_text
+from backend.runtime.visible_text import sanitize_visible_text, sanitize_visible_text_blocks
 
 
 def build_openai_completion_payload(
@@ -37,7 +38,7 @@ def build_openai_completion_payload(
         visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
         msg = {"role": "assistant", "content": visible_text}
         if execution.state.reasoning_text:
-            msg["reasoning_content"] = execution.state.reasoning_text
+            msg["reasoning_content"] = sanitize_visible_text(execution.state.reasoning_text)
         finish_reason = "stop"
 
     log_payload = [
@@ -82,8 +83,8 @@ def build_anthropic_message_payload(
     directive = directive or build_tool_directive(standard_request, execution.state)
     content_blocks: list[dict[str, Any]] = []
     if execution.state.reasoning_text:
-        content_blocks.append({"type": "thinking", "thinking": execution.state.reasoning_text})
-    content_blocks.extend(directive.tool_blocks)
+        content_blocks.append({"type": "thinking", "thinking": sanitize_visible_text(execution.state.reasoning_text)})
+    content_blocks.extend(sanitize_visible_text_blocks(directive.tool_blocks))
     visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
     if (
         directive.stop_reason != "tool_use"
@@ -104,11 +105,12 @@ def build_anthropic_message_payload(
 
 
 def build_gemini_generate_payload(*, execution) -> dict[str, Any]:
+    visible_text = sanitize_visible_text(execution.state.answer_text)
     return {
         "candidates": [
             {
                 "content": {
-                    "parts": [{"text": execution.state.answer_text}],
+                    "parts": [{"text": visible_text}],
                     "role": "model",
                 }
             }

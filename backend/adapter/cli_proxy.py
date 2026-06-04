@@ -7,6 +7,7 @@ from typing import Any
 
 from backend.adapter.standard_request import StandardRequest, CLAUDE_CODE_OPENAI_PROFILE
 from backend.core.config import resolve_model
+from backend.runtime.visible_text import sanitize_visible_text, sanitize_visible_text_blocks
 from backend.services.model_modes import parse_model_mode
 from backend.services.prompt_builder import messages_to_prompt
 from backend.services.workspace_context import derive_workspace_root
@@ -189,6 +190,7 @@ class CLIProxy:
         Returns:
             dict: OpenAI 格式的响应
         """
+        visible_text = sanitize_visible_text(execution.state.answer_text)
         return {
             "id": f"chatcmpl-{execution.chat_id[:12]}",
             "object": "chat.completion",
@@ -199,15 +201,15 @@ class CLIProxy:
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": execution.state.answer_text,
+                        "content": visible_text,
                     },
                     "finish_reason": "stop",
                 }
             ],
             "usage": {
                 "prompt_tokens": len(standard_request.prompt),
-                "completion_tokens": len(execution.state.answer_text),
-                "total_tokens": len(standard_request.prompt) + len(execution.state.answer_text),
+                "completion_tokens": len(visible_text),
+                "total_tokens": len(standard_request.prompt) + len(visible_text),
             },
         }
 
@@ -231,10 +233,10 @@ class CLIProxy:
 
         # 添加思考内容
         if execution.state.reasoning_text:
-            content_blocks.append({"type": "thinking", "thinking": execution.state.reasoning_text})
+            content_blocks.append({"type": "thinking", "thinking": sanitize_visible_text(execution.state.reasoning_text)})
 
         # 添加工具调用块
-        content_blocks.extend(directive.tool_blocks)
+        content_blocks.extend(sanitize_visible_text_blocks(directive.tool_blocks))
         visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
         if (
             directive.stop_reason != "tool_use"
@@ -269,11 +271,12 @@ class CLIProxy:
         Returns:
             dict: Gemini 格式的响应
         """
+        visible_text = sanitize_visible_text(execution.state.answer_text)
         return {
             "candidates": [
                 {
                     "content": {
-                        "parts": [{"text": execution.state.answer_text}],
+                        "parts": [{"text": visible_text}],
                         "role": "model",
                     },
                     "finishReason": "STOP",
@@ -282,8 +285,8 @@ class CLIProxy:
             ],
             "usageMetadata": {
                 "promptTokenCount": len(standard_request.prompt),
-                "candidatesTokenCount": len(execution.state.answer_text),
-                "totalTokenCount": len(standard_request.prompt) + len(execution.state.answer_text),
+                "candidatesTokenCount": len(visible_text),
+                "totalTokenCount": len(standard_request.prompt) + len(visible_text),
             },
         }
 

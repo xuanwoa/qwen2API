@@ -14,6 +14,7 @@ from backend.adapter.standard_request import StandardRequest
 from backend.core.request_logging import new_request_id, request_context, update_request_context
 from backend.core.request_trace import log_test_prompt, prompt_tail
 from backend.runtime.execution import build_tool_directive, build_usage_delta_factory, request_max_attempts, tool_directive_visible_text
+from backend.runtime.visible_text import VisibleTextSanitizer, sanitize_visible_text
 from backend.services.attachment_preprocessor import preprocess_attachments
 from backend.services.auth_quota import resolve_auth_context
 from backend.services.client_profiles import detect_openai_client_profile
@@ -457,7 +458,7 @@ def build_responses_payload(
         output_text = visible_text
         content: list[dict[str, Any]] = []
         if execution.state.reasoning_text:
-            content.append({"type": "reasoning_text", "text": execution.state.reasoning_text})
+            content.append({"type": "reasoning_text", "text": sanitize_visible_text(execution.state.reasoning_text)})
         content.append({"type": "output_text", "text": output_text, "annotations": []})
         payload["output"] = [{
             "id": f"msg_{uuid.uuid4().hex[:12]}",
@@ -490,7 +491,10 @@ class ResponsesStreamTranslator:
         self.started_text = False
         self.pending_chunks: list[str] = []
         self.answer_fragments: list[str] = []
+        self.visible_answer_fragments: list[str] = []
         self.reasoning_fragments: list[str] = []
+        self.answer_sanitizer = VisibleTextSanitizer()
+        self.reasoning_sanitizer = VisibleTextSanitizer()
         self.tool_calls_emitted = False
 
     def initial_chunks(self) -> list[str]:
@@ -523,6 +527,9 @@ class ResponsesStreamTranslator:
 
     def on_delta(self, evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
         if text_chunk and evt.get("phase") in ("think", "thinking_summary"):
+            text_chunk = self.reasoning_sanitizer.feed(text_chunk)
+            if not text_chunk:
+                return
             self.reasoning_fragments.append(text_chunk)
             self.pending_chunks.append(_sse("response.reasoning_text.delta", {
                 "response_id": self.response_id,
@@ -534,8 +541,12 @@ class ResponsesStreamTranslator:
             return
 
         if text_chunk and evt.get("phase") == "answer":
-            self._ensure_text_item()
             self.answer_fragments.append(text_chunk)
+            text_chunk = self.answer_sanitizer.feed(text_chunk)
+            if not text_chunk:
+                return
+            self._ensure_text_item()
+            self.visible_answer_fragments.append(text_chunk)
             self.pending_chunks.append(_sse("response.output_text.delta", {
                 "response_id": self.response_id,
                 "item_id": self.message_id,
@@ -552,6 +563,29 @@ class ResponsesStreamTranslator:
         chunks = self.pending_chunks
         self.pending_chunks = []
         return chunks
+
+    def _flush_visible_sanitizers(self) -> None:
+        reasoning_tail = self.reasoning_sanitizer.flush()
+        if reasoning_tail:
+            self.reasoning_fragments.append(reasoning_tail)
+            self.pending_chunks.append(_sse("response.reasoning_text.delta", {
+                "response_id": self.response_id,
+                "item_id": self.message_id,
+                "output_index": self.output_index,
+                "content_index": self.content_index,
+                "delta": reasoning_tail,
+            }))
+        answer_tail = self.answer_sanitizer.flush()
+        if answer_tail:
+            self._ensure_text_item()
+            self.visible_answer_fragments.append(answer_tail)
+            self.pending_chunks.append(_sse("response.output_text.delta", {
+                "response_id": self.response_id,
+                "item_id": self.message_id,
+                "output_index": self.output_index,
+                "content_index": self.content_index,
+                "delta": answer_tail,
+            }))
 
     def emit_tool_calls(self, tool_calls: list[dict[str, Any]]) -> None:
         for tool_call in tool_calls:
@@ -595,6 +629,7 @@ class ResponsesStreamTranslator:
             self.tool_calls_emitted = True
 
     def finalize(self, execution, directive) -> list[str]:
+        self._flush_visible_sanitizers()
         chunks = self.drain_pending()
         final_text = tool_directive_visible_text(
             directive,
@@ -621,9 +656,10 @@ class ResponsesStreamTranslator:
                     "delta": final_text,
                 }))
                 self.answer_fragments.append(final_text)
+                self.visible_answer_fragments.append(final_text)
             chunks.extend(self.drain_pending())
         elif directive.stop_reason != "tool_use":
-            streamed_text = "".join(self.answer_fragments)
+            streamed_text = "".join(self.visible_answer_fragments)
             if final_text.startswith(streamed_text):
                 missing_tail = final_text[len(streamed_text):]
                 if missing_tail:
@@ -635,6 +671,7 @@ class ResponsesStreamTranslator:
                         "delta": missing_tail,
                     }))
                     self.answer_fragments.append(missing_tail)
+                    self.visible_answer_fragments.append(missing_tail)
 
         if self.started_text:
             chunks.append(_sse("response.output_text.done", {

@@ -15,13 +15,14 @@ CHAT_TYPE_CAPABILITIES = {
     "slides": "slides",
 }
 
-MODEL_VARIANTS: tuple[tuple[str, str, str], ...] = (
-    ("thinking", "-thinking", "thinking"),
-    ("deep_research", "-deep-research", "deep_research"),
-    ("image_gen", "-image", "image"),
-    ("video_gen", "-video", "video"),
-    ("web_dev", "-webdev", "webdev"),
-    ("slides", "-slides", "slides"),
+MODEL_VARIANTS: tuple[tuple[str, str, str, dict[str, bool]], ...] = (
+    ("thinking", "-thinking", "thinking", {"thinking": True}),
+    ("search", "-search", "search", {"search": True}),
+    ("deep_research", "-deep-research", "deep_research", {"deep_research": True, "search": True}),
+    ("image_gen", "-image", "image", {"image_gen": True}),
+    ("video_gen", "-video", "video", {"video_gen": True}),
+    ("web_dev", "-webdev", "webdev", {"web_dev": True}),
+    ("slides", "-slides", "slides", {"slides": True}),
 )
 
 
@@ -158,12 +159,12 @@ def build_openai_model_list(upstream_models: list[dict[str, Any]]) -> dict[str, 
             owned_by=owned_by,
         ))
 
-        for capability_key, suffix, mode in MODEL_VARIANTS:
-            if capabilities.get(capability_key):
+        for capability_key, suffix, mode, variant_capabilities in MODEL_VARIANTS:
+            if capabilities.get(capability_key) or capability_key == "search":
                 add(build_model_entry(
                     model_id=f"{model_id}{suffix}",
                     base_model=model_id,
-                    capabilities=capabilities,
+                    capabilities=variant_capabilities,
                     mode=mode,
                     display_name=f"{display_name} {mode}",
                     family=family,

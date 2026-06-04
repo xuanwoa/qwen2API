@@ -188,6 +188,40 @@ class QwenClient:
                         delete_future.set_result(deleted)
                     self._deleting_chat_ids.pop(chat_id, None)
 
+    def delete_chat_background(
+        self,
+        token: str,
+        chat_id: str,
+        *,
+        source: str = "cleanup",
+        attempts: int | None = None,
+        base_delay: float | None = None,
+    ) -> asyncio.Task[None] | None:
+        """Schedule best-effort chat deletion without blocking the caller."""
+        if not token or not chat_id:
+            return None
+
+        async def runner() -> None:
+            try:
+                await self.delete_chat_reliable(
+                    token,
+                    chat_id,
+                    source=source,
+                    attempts=attempts,
+                    base_delay=base_delay,
+                )
+            except Exception as exc:
+                log.warning("[DeleteChat] background_failed chat_id=%s source=%s error=%s", chat_id, source, exc)
+
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(runner())
+            task.set_name(f"delete-chat-{chat_id[:8]}")
+            return task
+        except RuntimeError as exc:
+            log.warning("[DeleteChat] schedule_failed chat_id=%s source=%s error=%s", chat_id, source, exc)
+            return None
+
     async def list_chats(self, token: str, limit: int = 50) -> list[dict]:
         res = await self._request_json("GET", f"/api/v2/chats?limit={limit}", token, timeout=20.0)
         if res["status"] != 200:
@@ -525,6 +559,31 @@ class QwenClient:
                 if chunk:
                     yield {"chunk": chunk}
             yield {"status": "streamed"}
+
+    async def post_chat_completion_once(self, token: str, chat_id: str, payload: dict, timeout: float = 60.0) -> dict:
+        resp = await self._http_client.post(
+            f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
+            headers={**self._build_headers(token), "X-Accel-Buffering": "no"},
+            json=payload,
+            timeout=timeout,
+        )
+        return {"status": resp.status_code, "body": resp.text}
+
+    async def get_vision_task_status(self, token: str, task_id: str, timeout: float = 30.0) -> dict:
+        resp = await self._http_client.get(
+            f"{BASE_URL}/api/v1/tasks/status/{task_id}",
+            headers=self._build_headers(token),
+            timeout=timeout,
+        )
+        return {"status": resp.status_code, "body": resp.text}
+
+    async def get_chat_detail(self, token: str, chat_id: str, timeout: float = 30.0) -> dict:
+        resp = await self._http_client.get(
+            f"{BASE_URL}/api/v2/chats/{chat_id}",
+            headers=self._build_headers(token),
+            timeout=timeout,
+        )
+        return {"status": resp.status_code, "body": resp.text}
 
     async def chat_stream_events_with_retry(
         self,

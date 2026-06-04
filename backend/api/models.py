@@ -45,6 +45,8 @@ async def get_model(model_id: str):
     if mode.mode == "deep_research":
         capabilities["deep_research"] = True
         capabilities["search"] = True
+    if mode.mode == "search":
+        capabilities["search"] = True
     if mode.mode == "image":
         capabilities["image_gen"] = True
     if mode.mode == "video":

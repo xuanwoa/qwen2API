@@ -8,6 +8,7 @@ from typing import Any
 
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, StandardRequest
 from backend.runtime.execution import tool_directive_visible_text
+from backend.runtime.visible_text import sanitize_visible_text_blocks
 from backend.services.prompt_builder import _extract_text, _extract_user_text_only, _render_history_tool_call
 
 log = logging.getLogger("qwen2api.task_session")
@@ -337,7 +338,7 @@ def build_anthropic_assistant_history_message(*, execution, request: StandardReq
     for block in directive.tool_blocks:
         if block.get('type') == 'thinking':
             continue
-        content_blocks.append(block)
+        content_blocks.extend(sanitize_visible_text_blocks([block]))
     visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
     if directive.stop_reason != 'tool_use' and visible_text and not content_blocks:
         content_blocks.append({"type": "text", "text": visible_text})

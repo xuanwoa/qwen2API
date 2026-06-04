@@ -17,6 +17,7 @@ MODEL_MODE_SUFFIXES: tuple[tuple[str, str, bool, str], ...] = (
     ("-deep_research", "deep_research", False, "deep_research"),
     ("-web-dev", "web_dev", False, "webdev"),
     ("-thinking", "t2t", True, "thinking"),
+    ("-search", "t2t", False, "search"),
     ("-webdev", "web_dev", False, "webdev"),
     ("-image", "t2i", False, "image"),
     ("-video", "t2v", False, "video"),

@@ -11,6 +11,7 @@ from backend.core.config import resolve_model
 from backend.core.request_logging import new_request_id, request_context, update_request_context
 from backend.runtime import stream_presenter
 from backend.runtime.execution import collect_completion_run, cleanup_runtime_resources
+from backend.runtime.visible_text import VisibleTextSanitizer, sanitize_visible_text
 from backend.services.auth_quota import resolve_auth_context
 from backend.services.completion_bridge import force_fresh_chat_after_empty_response, is_empty_upstream_response
 from backend.services.token_calc import calculate_usage
@@ -74,7 +75,8 @@ async def gemini_generate_content(model: str, request: Request):
             log.error(f"Gemini proxy failed: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-        usage = calculate_usage(content, execution.state.answer_text)
+        visible_text = sanitize_visible_text(execution.state.answer_text)
+        usage = calculate_usage(content, visible_text)
         users = await users_db.get()
         for u in users:
             if u["id"] == token:
@@ -83,13 +85,13 @@ async def gemini_generate_content(model: str, request: Request):
         await users_db.save(users)
         await cleanup_runtime_resources(client, execution.acc, execution.chat_id)
 
-        log.info(f"[Gemini] Request complete. Generated {len(execution.state.answer_text)} characters.")
+        log.info(f"[Gemini] Request complete. Generated {len(visible_text)} visible characters.")
         return JSONResponse(
             {
                 "candidates": [
                     {
                         "content": {
-                            "parts": [{"text": execution.state.answer_text}],
+                            "parts": [{"text": visible_text}],
                             "role": "model",
                         }
                     }
@@ -109,10 +111,13 @@ async def gemini_stream_generate_content(model: str, request: Request):
 
         async def generate():
             queue: asyncio.Queue[str | None] = asyncio.Queue()
+            answer_sanitizer = VisibleTextSanitizer()
 
             async def on_delta(evt, text_chunk, _):
                 if text_chunk and evt.get("phase") == "answer":
-                    await queue.put(stream_presenter.gemini_text_chunk(text_chunk))
+                    visible_chunk = answer_sanitizer.feed(text_chunk)
+                    if visible_chunk:
+                        await queue.put(stream_presenter.gemini_text_chunk(visible_chunk))
 
             async def runner():
                 execution = None
@@ -129,7 +134,8 @@ async def gemini_stream_generate_content(model: str, request: Request):
                         await cleanup_runtime_resources(client, execution.acc, execution.chat_id, preserve_chat=False)
                         raise RuntimeError("empty upstream response")
 
-                    usage = calculate_usage(content, execution.state.answer_text)
+                    visible_text = sanitize_visible_text(execution.state.answer_text)
+                    usage = calculate_usage(content, visible_text)
                     users = await users_db.get()
                     for u in users:
                         if u["id"] == token:
@@ -137,10 +143,13 @@ async def gemini_stream_generate_content(model: str, request: Request):
                             break
                     await users_db.save(users)
                     await cleanup_runtime_resources(client, execution.acc, execution.chat_id)
-                    log.info(f"[Gemini] Request complete. Generated {len(execution.state.answer_text)} characters.")
+                    log.info(f"[Gemini] Request complete. Generated {len(visible_text)} visible characters.")
                 except Exception as e:
                     await queue.put(json.dumps({"error": str(e)}) + "\n")
                 finally:
+                    visible_tail = answer_sanitizer.flush()
+                    if visible_tail:
+                        await queue.put(stream_presenter.gemini_text_chunk(visible_tail))
                     await queue.put(None)
 
             task = asyncio.create_task(runner())

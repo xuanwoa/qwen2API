@@ -20,6 +20,7 @@ from backend.runtime.execution import (
     request_max_attempts,
     tool_directive_visible_text,
 )
+from backend.runtime.visible_text import VisibleTextSanitizer, sanitize_visible_text, sanitize_visible_text_blocks
 from backend.services.auth_quota import resolve_auth_context
 from backend.services.completion_bridge import force_fresh_chat_after_empty_response, is_empty_upstream_response
 from backend.services.context_attachment_manager import prepare_context_attachments, derive_session_key
@@ -75,6 +76,8 @@ class _AnthropicStreamState:
         self.block_index = 0
         self.current_block: dict[str, object] = {"type": None, "index": None, "tool_call_id": None}
         self.opened_tool_calls: set[str] = set()
+        self.answer_sanitizer = VisibleTextSanitizer()
+        self.thinking_sanitizer = VisibleTextSanitizer()
 
     def ensure_message_start(self) -> None:
         if not self.pending_chunks:
@@ -122,12 +125,24 @@ class _AnthropicStreamState:
         return index
 
     def append_thinking_delta(self, text_chunk: str) -> None:
+        text_chunk = self.thinking_sanitizer.feed(text_chunk)
+        if not text_chunk:
+            return
         index = self.open_textual_block("thinking")
         self.pending_chunks.append(
             stream_presenter.anthropic_content_block_delta(index, {"type": "thinking_delta", "thinking": text_chunk})
         )
 
     def buffer_answer_text(self, text_chunk: str) -> None:
+        thinking_tail = self.thinking_sanitizer.flush()
+        if thinking_tail:
+            index = self.open_textual_block("thinking")
+            self.pending_chunks.append(
+                stream_presenter.anthropic_content_block_delta(index, {"type": "thinking_delta", "thinking": thinking_tail})
+            )
+        text_chunk = self.answer_sanitizer.feed(text_chunk)
+        if not text_chunk:
+            return
         index = self.open_textual_block("text")
         self.answer_text_buffer.append((index, text_chunk))
 
@@ -150,6 +165,8 @@ class _AnthropicStreamState:
 
     def clear_answer_text(self) -> None:
         self.answer_text_buffer = []
+        self.flushed_answer_text = ""
+        self.answer_sanitizer.reset()
 
     def answer_text(self) -> str:
         return "".join(text_chunk for _, text_chunk in self.answer_text_buffer)
@@ -177,6 +194,18 @@ class _AnthropicStreamState:
         if not self.flushed_answer_text:
             self.answer_text_buffer = []
             self.buffer_answer_text(final_text)
+
+    def flush_text_sanitizers(self) -> None:
+        answer_tail = self.answer_sanitizer.flush()
+        if answer_tail:
+            index = self.open_textual_block("text")
+            self.answer_text_buffer.append((index, answer_tail))
+        thinking_tail = self.thinking_sanitizer.flush()
+        if thinking_tail:
+            index = self.open_textual_block("thinking")
+            self.pending_chunks.append(
+                stream_presenter.anthropic_content_block_delta(index, {"type": "thinking_delta", "thinking": thinking_tail})
+            )
 
 
 def _build_standard_request(req_data: dict) -> StandardRequest:
@@ -448,6 +477,7 @@ async def anthropic_messages(request: Request):
 
                             directive = build_tool_directive(standard_request, execution.state, history_messages=history_messages)
                             visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
+                            stream_state.flush_text_sanitizers()
                             if directive.stop_reason != "tool_use":
                                 stream_state.buffer_missing_answer_tail(visible_text)
                             if (
@@ -607,8 +637,8 @@ async def anthropic_messages(request: Request):
                     _log_response_tool_blocks("json_response", directive.tool_blocks)
                     content_blocks: list[dict] = []
                     if execution.state.reasoning_text:
-                        content_blocks.append({"type": "thinking", "thinking": execution.state.reasoning_text})
-                    content_blocks.extend(directive.tool_blocks)
+                        content_blocks.append({"type": "thinking", "thinking": sanitize_visible_text(execution.state.reasoning_text)})
+                    content_blocks.extend(sanitize_visible_text_blocks(directive.tool_blocks))
                     if (
                         directive.stop_reason != "tool_use"
                         and visible_text

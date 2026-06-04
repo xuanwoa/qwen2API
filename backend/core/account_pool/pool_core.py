@@ -2,6 +2,7 @@
 账号池核心逻辑 - 对齐 ds2api 的 pool_core.go
 """
 import asyncio
+import heapq
 import logging
 import time
 from typing import Optional
@@ -43,6 +44,7 @@ class Account:
         self.last_request_finished = float(kwargs.get("last_request_finished", 0.0) or 0.0)
         self.consecutive_failures = int(kwargs.get("consecutive_failures", 0) or 0)
         self.rate_limit_strikes = int(kwargs.get("rate_limit_strikes", 0) or 0)
+        self._pool_heap_version = 0
 
     def is_rate_limited(self) -> bool:
         return self.rate_limited_until > time.time()
@@ -124,6 +126,13 @@ class AccountPool:
 
         # 全局并发计数
         self.global_in_use = 0
+        self.ready_set_threshold = max(1, int(settings.ACCOUNT_READY_SET_THRESHOLD))
+        self.ready_set_enabled = False
+        self._valid_account_count = 0
+        self._account_by_email: dict[str, Account] = {}
+        self._ready_heap: list[tuple[float, float, float, int, str, int]] = []
+        self._cooldown_heap: list[tuple[float, int, str, int]] = []
+        self._heap_seq = 0
 
     async def load(self):
         """加载账号并初始化并发参数"""
@@ -135,6 +144,10 @@ class AccountPool:
     def _reset_concurrency_limits(self):
         """重置并发限制 - 对齐 ds2api 的 Reset() 逻辑"""
         account_count = len([a for a in self.accounts if a.is_available()])
+        ready_set_account_count = len([a for a in self.accounts if a.valid])
+        self._valid_account_count = ready_set_account_count
+        self.ready_set_threshold = max(1, int(settings.ACCOUNT_READY_SET_THRESHOLD))
+        self.ready_set_enabled = ready_set_account_count >= self.ready_set_threshold
 
         # 计算推荐并发值（对齐 ds2api）
         self.recommended_concurrency = account_count * self.max_inflight_per_account
@@ -151,8 +164,110 @@ class AccountPool:
             f"max_inflight_per_account={self.max_inflight_per_account}, "
             f"global_max_inflight={self.global_max_inflight}, "
             f"recommended_concurrency={self.recommended_concurrency}, "
-            f"max_queue_size={self.max_queue_size}"
+            f"max_queue_size={self.max_queue_size}, "
+            f"ready_set_accounts={ready_set_account_count}, "
+            f"ready_set_enabled={self.ready_set_enabled}, "
+            f"ready_set_threshold={self.ready_set_threshold}"
         )
+        self._rebuild_ready_set()
+
+    def _next_heap_version(self, acc: Account) -> int:
+        self._heap_seq += 1
+        acc._pool_heap_version = self._heap_seq
+        return acc._pool_heap_version
+
+    def _rebuild_ready_set(self) -> None:
+        self._account_by_email = {a.email: a for a in self.accounts if a.email}
+        self._ready_heap = []
+        self._cooldown_heap = []
+        self._heap_seq = 0
+        now = time.time()
+        if not self.ready_set_enabled:
+            for acc in self.accounts:
+                acc._pool_heap_version = 0
+            return
+        for acc in self.accounts:
+            self._index_account_locked(acc, now=now)
+
+    def _index_account_locked(self, acc: Account, *, now: float | None = None) -> None:
+        """Refresh one account in the large-pool ready/cooldown index."""
+        if not self.ready_set_enabled or not acc or not acc.email:
+            return
+        now = time.time() if now is None else now
+        version = self._next_heap_version(acc)
+        if not acc.valid or acc.inflight >= self.max_inflight_per_account:
+            return
+        ready_at = acc.next_available_at()
+        if ready_at <= now:
+            heapq.heappush(
+                self._ready_heap,
+                (
+                    float(acc.inflight),
+                    float(acc.last_request_started or 0.0),
+                    float(acc.last_used or 0.0),
+                    version,
+                    acc.email,
+                    version,
+                ),
+            )
+            return
+        heapq.heappush(self._cooldown_heap, (float(ready_at), version, acc.email, version))
+
+    def _promote_ready_set_locked(self, now: float) -> None:
+        if not self.ready_set_enabled:
+            return
+        while self._cooldown_heap and self._cooldown_heap[0][0] <= now:
+            _, _, email, version = heapq.heappop(self._cooldown_heap)
+            acc = self._account_by_email.get(email)
+            if acc is None or acc._pool_heap_version != version:
+                continue
+            self._index_account_locked(acc, now=now)
+
+    def _account_ready_now_locked(self, acc: Account, now: float) -> bool:
+        return (
+            acc.is_available()
+            and acc.inflight < self.max_inflight_per_account
+            and acc.next_available_at() <= now
+        )
+
+    def _pop_ready_set_locked(self, *, now: float, exclude: Optional[set] = None) -> Optional[Account]:
+        if not self.ready_set_enabled:
+            return None
+        self._promote_ready_set_locked(now)
+        deferred: list[tuple[float, float, float, int, str, int]] = []
+        try:
+            while self._ready_heap:
+                entry = heapq.heappop(self._ready_heap)
+                _, _, _, _, email, version = entry
+                acc = self._account_by_email.get(email)
+                if acc is None or acc._pool_heap_version != version:
+                    continue
+                if exclude and email in exclude:
+                    deferred.append(entry)
+                    continue
+                if not self._account_ready_now_locked(acc, now):
+                    self._index_account_locked(acc, now=now)
+                    continue
+                return acc
+            return None
+        finally:
+            for entry in deferred:
+                heapq.heappush(self._ready_heap, entry)
+
+    def _next_ready_set_time_locked(self, now: float) -> float:
+        if not self.ready_set_enabled:
+            return now
+        self._promote_ready_set_locked(now)
+        if self._ready_heap:
+            return now
+        while self._cooldown_heap:
+            ready_at, _, email, version = self._cooldown_heap[0]
+            acc = self._account_by_email.get(email)
+            if acc is None or acc._pool_heap_version != version:
+                heapq.heappop(self._cooldown_heap)
+                continue
+            return ready_at
+        return now + 0.5
 
     async def save(self):
         await self.db.save([a.to_dict() for a in self.accounts])
@@ -175,6 +290,9 @@ class AccountPool:
         self._reset_concurrency_limits()
 
     def get_by_email(self, email: str) -> Optional[Account]:
+        account = self._account_by_email.get(email)
+        if account is not None:
+            return account
         return next((a for a in self.accounts if a.email == email), None)
 
     def _can_acquire_global(self) -> bool:
@@ -211,6 +329,11 @@ class AccountPool:
             "recommended_concurrency": self.recommended_concurrency,
             "max_queue_size": self.max_queue_size,
             "global_max_inflight": self.global_max_inflight,
+            "ready_set_enabled": self.ready_set_enabled,
+            "ready_set_threshold": self.ready_set_threshold,
+            "ready_set_accounts": self._valid_account_count,
+            "ready_heap_size": len(self._ready_heap),
+            "cooldown_heap_size": len(self._cooldown_heap),
             "waiting": self._waiters_queue.qsize(),
             "account_min_interval_ms": getattr(settings, "ACCOUNT_MIN_INTERVAL_MS", 0),
         }

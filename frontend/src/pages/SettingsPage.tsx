@@ -4,6 +4,14 @@ import { Button } from "../components/ui/button"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
+import {
+  capabilityBadges,
+  fetchModelOptions,
+  formatModeLabel,
+  formatModelName,
+  groupModelOptions,
+  type ModelOption,
+} from "../lib/models"
 
 type ModelAliases = Record<string, string>
 
@@ -24,6 +32,8 @@ export default function SettingsPage() {
   const [poolTarget, setPoolTarget] = useState(5)
   const [poolTtlMin, setPoolTtlMin] = useState(10)
   const [modelAliases, setModelAliases] = useState("")
+  const [models, setModels] = useState<ModelOption[]>([])
+  const [modelsLoading, setModelsLoading] = useState(false)
 
   const fetchSettings = useCallback(() => {
     fetch(`${API_BASE}/api/admin/settings`, { headers: getAuthHeader() })
@@ -42,9 +52,18 @@ export default function SettingsPage() {
       .catch(() => toast.error("配置获取失败，请检查会话 Key"))
   }, [])
 
+  const fetchModels = useCallback(() => {
+    setModelsLoading(true)
+    fetchModelOptions()
+      .then(setModels)
+      .catch(() => setModels([]))
+      .finally(() => setModelsLoading(false))
+  }, [])
+
   useEffect(() => {
     fetchSettings()
-  }, [fetchSettings])
+    fetchModels()
+  }, [fetchSettings, fetchModels])
 
   const handleSaveSessionKey = () => {
     if (!sessionKey.trim()) {
@@ -107,6 +126,7 @@ export default function SettingsPage() {
   }
 
   const baseUrl = API_BASE || `http://${window.location.hostname}:7860`
+  const modelGroups = groupModelOptions(models)
 
   const curlExample = `# OpenAI streaming chat
   curl ${baseUrl}/v1/chat/completions \
@@ -173,21 +193,24 @@ export default function SettingsPage() {
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer YOUR_API_KEY" \
     -d '{
-      "model": "dall-e-3",
+      "model": "qwen3.6-plus-image",
       "prompt": "A cyberpunk cat with neon lights, ultra realistic",
       "n": 1,
-      "size": "1024x1024",
+      "size": "1328x1328",
       "response_format": "url"
     }'
 
-  # Video (reserved path)
-  curl ${baseUrl}/v1/chat/completions \
+  # Video
+  curl ${baseUrl}/v1/videos/generations \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer YOUR_API_KEY" \
     -d '{
-      "model": "qwen3.6-plus",
-      "stream": false,
-      "messages": [{"role": "user", "content": "Generate a slow-motion ocean-wave video."}]
+      "model": "qwen3.6-plus-video",
+      "prompt": "Generate a slow-motion ocean-wave video.",
+      "duration": 5,
+      "size": "1664x928",
+      "ratio": "16:9",
+      "response_format": "url"
     }'`
 
   return (
@@ -197,7 +220,7 @@ export default function SettingsPage() {
           <h2 className="text-2xl font-bold tracking-tight">系统设置</h2>
           <p className="text-muted-foreground">管理控制台认证与网关运行时配置。</p>
         </div>
-        <Button variant="outline" onClick={() => {fetchSettings(); toast.success("配置已刷新")}}>
+        <Button variant="outline" onClick={() => {fetchSettings(); fetchModels(); toast.success("配置已刷新")}}>
           <RefreshCw className="mr-2 h-4 w-4" /> 刷新配置
         </Button>
       </div>
@@ -240,6 +263,69 @@ export default function SettingsPage() {
               <label className="text-sm font-medium">API 基础地址 (Base URL)</label>
               <input type="text" readOnly value={baseUrl} className="flex h-10 w-full rounded-md border border-input bg-muted px-3 py-2 text-sm font-mono text-muted-foreground" />
             </div>
+          </div>
+        </div>
+
+        {/* Model Catalog */}
+        <div className="rounded-xl border bg-card text-card-foreground shadow-sm min-w-0">
+          <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
+            <div className="flex items-center gap-2">
+              <Settings2 className="h-5 w-5 text-primary" />
+              <h3 className="font-semibold leading-none tracking-tight">模型名称 / 模型目录</h3>
+            </div>
+            <p className="text-sm text-muted-foreground">从 /v1/models 读取当前可用模型，按系列折叠展示。同系列例如 qwen3.6 会归在一个分组里。</p>
+          </div>
+          <div className="p-6 space-y-3">
+            {modelsLoading ? (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <RefreshCw className="h-4 w-4 animate-spin" /> 正在读取模型列表...
+              </div>
+            ) : modelGroups.length === 0 ? (
+              <div className="rounded-lg border border-dashed bg-muted/20 p-4 text-sm text-muted-foreground">
+                暂无模型数据。请确认会话 Key 有权限访问 /v1/models。
+              </div>
+            ) : (
+              modelGroups.map((group, index) => (
+                <details key={group.family} open={index === 0} className="rounded-lg border bg-background/60">
+                  <summary className="cursor-pointer select-none px-4 py-3 text-sm font-semibold">
+                    {group.family}
+                    <span className="ml-2 rounded-full bg-muted px-2 py-0.5 text-xs font-normal text-muted-foreground">
+                      {group.models.length} 个模型
+                    </span>
+                  </summary>
+                  <div className="border-t divide-y">
+                    {group.models.map(option => {
+                      const badges = capabilityBadges(option)
+                      return (
+                        <div key={option.id} className="grid gap-2 px-4 py-3 text-sm md:grid-cols-[1.4fr_1fr_0.7fr_1fr] md:items-center">
+                          <div className="min-w-0">
+                            <div className="truncate font-medium">{formatModelName(option)}</div>
+                            <div className="truncate font-mono text-xs text-muted-foreground">{option.id}</div>
+                          </div>
+                          <div className="min-w-0 font-mono text-xs text-muted-foreground">
+                            base: {option.base_model || option.id}
+                          </div>
+                          <div>
+                            <span className="rounded-full border bg-muted/50 px-2 py-0.5 text-xs">
+                              {formatModeLabel(option.mode)}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {badges.length ? badges.map(label => (
+                              <span key={label} className="rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-xs text-primary">
+                                {label}
+                              </span>
+                            )) : (
+                              <span className="text-xs text-muted-foreground">对话</span>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </details>
+              ))
+            )}
           </div>
         </div>
 

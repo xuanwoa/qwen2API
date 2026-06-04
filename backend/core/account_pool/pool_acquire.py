@@ -25,6 +25,20 @@ def _jitter_seconds() -> float:
 class AccountAcquireMixin:
     """账号获取逻辑混入类"""
 
+    def _assign_account_locked(self, acc: "Account", now: float) -> None:
+        """Assign an account while the pool lock is held."""
+        acc.inflight += 1
+        acc.last_used = now
+        acc.last_request_started = now + _jitter_seconds()
+        self.global_in_use += 1
+
+    def _refresh_ready_set_mode_after_valid_change(self) -> bool:
+        should_enable = self._valid_account_count >= self.ready_set_threshold
+        if should_enable == self.ready_set_enabled:
+            return False
+        self._reset_concurrency_limits()
+        return True
+
     async def _remove_waiter(self, waiter: asyncio.Event) -> None:
         """
         从等待队列中移除 waiter（若仍在队列中）。
@@ -54,6 +68,15 @@ class AccountAcquireMixin:
             if not self._can_acquire_global():
                 return None
 
+            if self.ready_set_enabled:
+                best = self._pop_ready_set_locked(now=now, exclude=exclude)
+                if best is None:
+                    return None
+                self._assign_account_locked(best, now)
+                self._index_account_locked(best, now=now)
+                self._sticky_email = best.email
+                return best
+
             # 筛选可用账号
             available = [a for a in self.accounts if a.is_available() and (not exclude or a.email not in exclude)]
             if not available:
@@ -69,10 +92,7 @@ class AccountAcquireMixin:
             best = ready[0]
 
             # 分配账号
-            best.inflight += 1
-            best.last_used = now
-            best.last_request_started = now + _jitter_seconds()
-            self.global_in_use += 1
+            self._assign_account_locked(best, now)
             self._sticky_email = best.email if len(ready) == 1 else None
 
             return best
@@ -93,7 +113,7 @@ class AccountAcquireMixin:
                 return None
 
             # 查找指定账号
-            preferred = next((a for a in self.accounts if a.email == preferred_email), None)
+            preferred = self.get_by_email(preferred_email)
             if (
                 preferred
                 and preferred.is_available()
@@ -101,10 +121,9 @@ class AccountAcquireMixin:
                 and preferred.next_available_at() <= now
                 and (not exclude or preferred.email not in exclude)
             ):
-                preferred.inflight += 1
-                preferred.last_used = now
-                preferred.last_request_started = now + _jitter_seconds()
-                self.global_in_use += 1
+                self._assign_account_locked(preferred, now)
+                if self.ready_set_enabled:
+                    self._index_account_locked(preferred, now=now)
                 self._sticky_email = preferred.email
                 return preferred
 
@@ -126,12 +145,17 @@ class AccountAcquireMixin:
 
             # 检查是否还有候选账号
             async with self._lock:
-                candidates = [a for a in self.accounts if a.valid and (not exclude or a.email not in exclude)]
-                if not candidates:
-                    return None
+                if self.ready_set_enabled and not exclude:
+                    if self._valid_account_count <= 0:
+                        return None
+                    next_ready_at = self._next_ready_set_time_locked(time.time())
+                else:
+                    candidates = [a for a in self.accounts if a.valid and (not exclude or a.email not in exclude)]
+                    if not candidates:
+                        return None
 
-                # 计算下次可用时间
-                next_ready_at = min((a.next_available_at() for a in candidates), default=time.time())
+                    # 计算下次可用时间
+                    next_ready_at = min((a.next_available_at() for a in candidates), default=time.time())
 
             # 检查超时
             remaining = deadline - time.time()
@@ -199,6 +223,8 @@ class AccountAcquireMixin:
         acc.inflight = max(0, acc.inflight - 1)
         acc.last_request_finished = time.time()
         self.global_in_use = max(0, self.global_in_use - 1)
+        if self.ready_set_enabled:
+            self._index_account_locked(acc, now=acc.last_request_finished)
 
         # 唤醒等待队列中的第一个
         self._notify_waiter()
@@ -219,24 +245,36 @@ class AccountAcquireMixin:
 
     def mark_invalid(self, acc: "Account", reason: str = "invalid", error_message: str = ""):
         """标记账号为不可用"""
+        was_valid = acc.valid
         acc.valid = False
         acc.status_code = reason or "invalid"
         acc.last_error = error_message or acc.last_error
         acc.consecutive_failures += 1
+        if was_valid:
+            self._valid_account_count = max(0, self._valid_account_count - 1)
         if reason == "pending_activation":
             acc.activation_pending = True
         if self._sticky_email == acc.email:
             self._sticky_email = None
+        mode_rebuilt = self._refresh_ready_set_mode_after_valid_change()
+        if not mode_rebuilt and self.ready_set_enabled:
+            self._index_account_locked(acc, now=time.time())
         log.warning(f"[账号] {acc.email} 已标记为不可用，状态={acc.status_code}")
 
     def mark_success(self, acc: "Account"):
         """标记账号请求成功"""
+        was_valid = acc.valid
         acc.consecutive_failures = 0
         acc.rate_limit_strikes = 0
         if acc.status_code == "rate_limited":
             acc.status_code = "valid"
         if not acc.activation_pending:
             acc.valid = True
+        if acc.valid and not was_valid:
+            self._valid_account_count += 1
+        mode_rebuilt = self._refresh_ready_set_mode_after_valid_change()
+        if not mode_rebuilt and self.ready_set_enabled:
+            self._index_account_locked(acc, now=time.time())
 
     def mark_rate_limited(self, acc: "Account", cooldown: int | None = None, error_message: str = ""):
         """标记账号被限流"""
@@ -249,4 +287,6 @@ class AccountAcquireMixin:
         acc.last_error = error_message or acc.last_error
         if self._sticky_email == acc.email:
             self._sticky_email = None
+        if self.ready_set_enabled:
+            self._index_account_locked(acc, now=time.time())
         log.warning(f"[账号] {acc.email} 已限流冷却 {dynamic} 秒")

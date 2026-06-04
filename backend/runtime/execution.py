@@ -13,6 +13,7 @@ from backend.core.config import settings
 from backend.core.request_logging import update_request_context
 from backend.core.request_trace import find_test_markers, log_test_prompt
 from backend.runtime.stream_metrics import StreamMetrics
+from backend.runtime.visible_text import sanitize_visible_text
 from backend.services import tool_parser
 from backend.services.workspace_context import build_workspace_final_reminder
 from backend.toolcall.formats_qnml import render_qnml_tool_calls
@@ -103,8 +104,8 @@ def tool_directive_visible_text(directive: "RuntimeToolDirective", fallback_text
         if isinstance(text, str) and text:
             text_parts.append(text)
     if saw_text_block:
-        return "".join(text_parts)
-    return fallback_text or ""
+        return sanitize_visible_text("".join(text_parts))
+    return sanitize_visible_text(fallback_text or "")
 
 
 @dataclass(slots=True)
@@ -228,6 +229,7 @@ __all__ = [
     "recent_same_tool_identity_count",
     "request_max_attempts",
     "retryable_usage_delta",
+    "sanitize_visible_text",
     "should_force_finish_after_tool_use",
     "tool_identity",
     "tool_directive_visible_text",
@@ -922,17 +924,6 @@ def _final_delivery_retry_message(gap: FinalDeliveryGap) -> str:
     return "\n".join(lines)
 
 
-def _append_final_phrase_to_answer(state: RuntimeAttemptState, final_phrase: str) -> bool:
-    if not final_phrase:
-        return False
-    current = state.answer_text or ""
-    if current.rstrip().endswith(final_phrase):
-        return False
-    trimmed = current.rstrip()
-    state.answer_text = f"{trimmed}\n{final_phrase}" if trimmed else final_phrase
-    return True
-
-
 def _delivery_guard_prompt(request: StandardRequest, current_prompt: str | None = None) -> str:
     return current_prompt or getattr(request, "prompt", "") or getattr(request, "full_prompt", "") or ""
 
@@ -963,13 +954,15 @@ def _complete_final_delivery_if_safe(
         )
         return gap
     if gap.final_phrase_missing and gap.final_phrase:
-        if _append_final_phrase_to_answer(state, gap.final_phrase):
-            log.warning(
-                "[FinalDeliveryGuard] source=%s appended final phrase before end_turn phrase=%s targets=%s",
-                source,
-                gap.final_phrase,
-                gap.target_paths[-4:],
-            )
+        # Never mutate user-visible text here. Long-running Claude Code sessions can keep
+        # old test prompts in history, and appending their final sentinel leaks into later replies.
+        log.info(
+            "[FinalDeliveryGuard] source=%s ignored missing final phrase phrase=%s targets=%s",
+            source,
+            gap.final_phrase,
+            gap.target_paths[-4:],
+        )
+        return None
     return gap
 
 
@@ -2042,12 +2035,6 @@ def evaluate_retry_directive(
             source="retry",
         )
         if delivery_gap is not None:
-            if (
-                not delivery_gap.missing_artifact_markers
-                and delivery_gap.final_phrase
-                and (delivery_gap.final_phrase_missing or state.answer_text.rstrip().endswith(delivery_gap.final_phrase))
-            ):
-                return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason="final_phrase_appended")
             log.warning(
                 "[FinalDeliveryGuard] retry missing_markers=%s final_phrase_missing=%s targets=%s",
                 delivery_gap.missing_artifact_markers,
@@ -2242,11 +2229,30 @@ async def cleanup_runtime_resources(client, acc, chat_id: str | None, *, preserv
     if preserve_chat:
         return
     if chat_id and token:
+        background_delete = getattr(client, "delete_chat_background", None)
+        if background_delete is not None:
+            background_delete(token, chat_id, source="runtime_cleanup")
+            return
         delete_fn = getattr(client, "delete_chat_reliable", None)
         if delete_fn is not None:
-            await delete_fn(token, chat_id, source="runtime_cleanup")
+            async def delete_runner() -> None:
+                try:
+                    await delete_fn(token, chat_id, source="runtime_cleanup")
+                except Exception as exc:
+                    log.warning("[Cleanup] background delete_chat failed chat_id=%s error=%s", chat_id, exc)
+
+            try:
+                asyncio.create_task(delete_runner())
+            except RuntimeError:
+                await delete_fn(token, chat_id, source="runtime_cleanup")
             return
         try:
-            await client.delete_chat(token, chat_id)
+            async def raw_delete_runner() -> None:
+                try:
+                    await client.delete_chat(token, chat_id)
+                except Exception as exc:
+                    log.warning("[Cleanup] background delete_chat failed chat_id=%s error=%s", chat_id, exc)
+
+            asyncio.create_task(raw_delete_runner())
         except Exception as exc:
             log.warning("[Cleanup] delete_chat failed chat_id=%s error=%s", chat_id, exc)

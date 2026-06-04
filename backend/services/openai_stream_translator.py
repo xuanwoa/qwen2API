@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE
 from backend.runtime.execution import RuntimeToolDirective, tool_directive_visible_text
+from backend.runtime.visible_text import VisibleTextSanitizer
 from backend.toolcall.parser import parse_tool_calls_detailed
 
 
@@ -37,6 +38,9 @@ class OpenAIStreamTranslator:
         self.answer_fragments: list[str] = []
         self.buffered_toolish_fragments: list[str] = []
         self.pending_content_chunks: list[str] = []
+        self.visible_answer_fragments: list[str] = []
+        self.content_sanitizer = VisibleTextSanitizer()
+        self.reasoning_sanitizer = VisibleTextSanitizer()
         self.tool_calls_emitted = False
         self.tool_text_detection_mode = self._resolve_tool_text_detection_mode(client_profile)
         self.tool_call_finalize_mode = self._resolve_tool_call_finalize_mode(client_profile)
@@ -185,20 +189,45 @@ class OpenAIStreamTranslator:
         self.pending_chunks.append(f"data: {json.dumps(yield_payload, ensure_ascii=False)}\n\n")
         self.role_chunk_sent = True
 
-    def _emit_content_chunk(self, text_chunk: str) -> None:
+    def _append_content_chunk(self, text_chunk: str) -> None:
+        if not text_chunk:
+            return
         chunk = (
             f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'content': text_chunk}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
         )
         self.pending_chunks.append(chunk)
         self.pending_content_chunks.append(chunk)
+        self.visible_answer_fragments.append(text_chunk)
 
-    def _emit_reasoning_chunk(self, text_chunk: str) -> None:
-        """把 Qwen 的思考内容以 DeepSeek R1 风格 reasoning_content 发出去，
-        让网页端/客户端能显示推理过程。"""
+    def _emit_content_chunk(self, text_chunk: str) -> str:
+        sanitized = self.content_sanitizer.feed(text_chunk)
+        self._append_content_chunk(sanitized)
+        return sanitized
+
+    def _flush_content_sanitizer(self) -> str:
+        sanitized = self.content_sanitizer.flush()
+        self._append_content_chunk(sanitized)
+        return sanitized
+
+    def _append_reasoning_chunk(self, text_chunk: str) -> None:
+        if not text_chunk:
+            return
         chunk = (
             f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'reasoning_content': text_chunk}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
         )
         self.pending_chunks.append(chunk)
+
+    def _emit_reasoning_chunk(self, text_chunk: str) -> str:
+        """把 Qwen 的思考内容以 DeepSeek R1 风格 reasoning_content 发出去，
+        让网页端/客户端能显示推理过程。"""
+        sanitized = self.reasoning_sanitizer.feed(text_chunk)
+        self._append_reasoning_chunk(sanitized)
+        return sanitized
+
+    def _flush_reasoning_sanitizer(self) -> str:
+        sanitized = self.reasoning_sanitizer.flush()
+        self._append_reasoning_chunk(sanitized)
+        return sanitized
 
     def _discard_pending_content_chunks(self) -> None:
         if not self.pending_content_chunks:
@@ -206,6 +235,8 @@ class OpenAIStreamTranslator:
         pending_content_ids = {id(chunk) for chunk in self.pending_content_chunks}
         self.pending_chunks = [chunk for chunk in self.pending_chunks if id(chunk) not in pending_content_ids]
         self.pending_content_chunks = []
+        self.visible_answer_fragments = []
+        self.content_sanitizer.reset()
 
     def drain_pending(self) -> list[str]:
         """Return and clear chunks that are safe to send immediately.
@@ -258,20 +289,24 @@ class OpenAIStreamTranslator:
     def _emit_missing_safe_text(self, safe_text: str) -> bool:
         if not safe_text:
             return False
-        streamed_text = "".join(self.answer_fragments)
+        streamed_text = "".join(self.visible_answer_fragments)
         if safe_text.startswith(streamed_text):
             missing_tail = safe_text[len(streamed_text):]
             if missing_tail:
-                self._emit_content_chunk(missing_tail)
+                emitted = self._emit_content_chunk(missing_tail)
                 self.answer_fragments.append(missing_tail)
-            return bool(missing_tail)
+                return bool(emitted)
+            return False
         self._discard_pending_content_chunks()
-        self._emit_content_chunk(safe_text)
+        emitted = self._emit_content_chunk(safe_text)
+        emitted += self._flush_content_sanitizer()
         self.answer_fragments = [safe_text]
-        return True
+        return bool(emitted)
 
     def finalize(self, finish_reason: str, directive: RuntimeToolDirective | None = None) -> list[str]:
         self._flush_pending_think_text()
+        self._flush_content_sanitizer()
+        self._flush_reasoning_sanitizer()
         final_finish_reason = finish_reason
         buffered_text = "".join(self.buffered_toolish_fragments)
         if directive is None and self.build_final_directive is not None and not self.tool_calls_emitted:
@@ -299,6 +334,8 @@ class OpenAIStreamTranslator:
         elif buffered_text and not self.tool_calls_emitted:
             self._emit_content_chunk(buffered_text)
 
+        self._flush_content_sanitizer()
+        self._flush_reasoning_sanitizer()
         chunks = list(self.pending_chunks)
         chunks.append(
             f"data: {json.dumps({'id': self.completion_id, 'object': 'chat.completion.chunk', 'created': self.created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': final_finish_reason}]}, ensure_ascii=False)}\n\n"

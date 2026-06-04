@@ -269,8 +269,11 @@ async def get_settings(request: Request):
         "max_inflight_per_account": backend_settings.MAX_INFLIGHT_PER_ACCOUNT,
         "global_max_inflight": getattr(acc_pool, "global_max_inflight", 0),
         "max_queue_size": getattr(acc_pool, "max_queue_size", 0),
+        "account_ready_set_threshold": backend_settings.ACCOUNT_READY_SET_THRESHOLD,
+        "account_ready_set_enabled": getattr(acc_pool, "ready_set_enabled", False),
         "chat_id_pool_target": pool.target if pool else 0,
         "chat_id_pool_ttl_seconds": pool.ttl if pool else 0,
+        "chat_id_pool_max_concurrency": pool.max_concurrency if pool else 0,
         "model_aliases": safe_map,
     }
 
@@ -286,6 +289,15 @@ async def update_settings(data: dict, request: Request):
                 pool.set_max_inflight(val)
         except (TypeError, ValueError):
             pass
+    if "account_ready_set_threshold" in data:
+        try:
+            val = max(1, int(data["account_ready_set_threshold"]))
+            settings.ACCOUNT_READY_SET_THRESHOLD = val
+            pool = getattr(request.app.state, "account_pool", None)
+            if pool is not None and hasattr(pool, "_reset_concurrency_limits"):
+                pool._reset_concurrency_limits()
+        except (TypeError, ValueError):
+            pass
     if "global_max_inflight" in data:
         try:
             val = int(data["global_max_inflight"])
@@ -294,12 +306,13 @@ async def update_settings(data: dict, request: Request):
                 pool.global_max_inflight = val
         except (TypeError, ValueError):
             pass
-    if "chat_id_pool_target" in data or "chat_id_pool_ttl_seconds" in data:
+    if "chat_id_pool_target" in data or "chat_id_pool_ttl_seconds" in data or "chat_id_pool_max_concurrency" in data:
         cp = getattr(request.app.state, "chat_id_pool", None)
         if cp is not None:
             await cp.apply_config(
                 target=data.get("chat_id_pool_target"),
                 ttl_seconds=data.get("chat_id_pool_ttl_seconds"),
+                max_concurrency=data.get("chat_id_pool_max_concurrency"),
             )
     if "model_aliases" in data:
         MODEL_MAP.clear()

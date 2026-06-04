@@ -1,5 +1,5 @@
 import { Outlet, Link, useLocation } from "react-router-dom"
-import { Activity, Key, Settings, LayoutDashboard, MessageSquare, Menu, X, Image } from "lucide-react"
+import { Activity, Key, Settings, LayoutDashboard, MessageSquare, Menu, X, Image, Video } from "lucide-react"
 import { useState } from "react"
 
 export default function AdminLayout() {
@@ -12,6 +12,7 @@ export default function AdminLayout() {
     { name: "API Key", path: "/tokens", icon: Key },
     { name: "接口测试", path: "/test", icon: MessageSquare },
     { name: "图片生成", path: "/images", icon: Image },
+    { name: "视频生成", path: "/videos", icon: Video },
     { name: "系统设置", path: "/settings", icon: Settings },
   ]
 

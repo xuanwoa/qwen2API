@@ -43,6 +43,8 @@ def build_chat_standard_request(req_data: dict, *, default_model: str, surface: 
     explicit_thinking = _extract_thinking_enabled(req_data)
     thinking_enabled = True if model_mode.force_thinking else explicit_thinking
     enable_search = bool(_coerce_bool(req_data.get("enable_search")) or False)
+    if model_mode.mode == "search":
+        enable_search = True
     if model_mode.chat_type == "deep_research":
         enable_search = True
     prompt_result = messages_to_prompt(req_data, client_profile=client_profile)

@@ -150,6 +150,8 @@ def _extract_first_json_tool_call(text: str) -> str | None:
 
 def _normalize_fragmented_tool_call(answer: str) -> str:
     text = answer.strip()
+    if re.search(r"function\.name\s*:", text, flags=re.IGNORECASE):
+        return text
     if ("##TOOL_CALL##" in text and "##END_CALL##" in text) or ("<|QNML|tool_calls" in text and "</|QNML|tool_calls" in text) or ("<tool_calls" in text and "</tool_calls" in text):
         return text
 
@@ -187,6 +189,8 @@ def _normalize_fragmented_tool_call(answer: str) -> str:
 def _coerce_tool_input(name: str, input_data: Any, tools: list[dict[str, Any]]) -> Any:
     if not isinstance(input_data, dict):
         return input_data
+
+    input_data = _coerce_tool_input_by_schema(name, input_data, tools)
 
     # 修正 AskUserQuestion 工具参数
     if name == "AskUserQuestion":
@@ -269,6 +273,11 @@ def _coerce_tool_input(name: str, input_data: Any, tools: list[dict[str, Any]]) 
                 if alias in fixed:
                     fixed["file_path"] = fixed.pop(alias)
                     break
+        if name == "Write" and "content" not in fixed:
+            for alias in ("text", "body", "data", "file_content", "contents", "value"):
+                if alias in fixed:
+                    fixed["content"] = fixed.pop(alias)
+                    break
         return fixed
 
     if name == "Bash":
@@ -302,6 +311,125 @@ def _coerce_tool_input(name: str, input_data: Any, tools: list[dict[str, Any]]) 
         return coerced
 
     return input_data
+
+
+def _tool_schema(tool_name: str, tools: list[dict[str, Any]]) -> dict[str, Any]:
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        schema = tool.get("parameters") or tool.get("input_schema")
+        function_payload = tool.get("function")
+        if isinstance(function_payload, dict):
+            name = name or function_payload.get("name")
+            schema = schema or function_payload.get("parameters")
+        if name == tool_name and isinstance(schema, dict):
+            return schema
+    return {}
+
+
+def _schema_types(schema: Any) -> set[str]:
+    if not isinstance(schema, dict):
+        return set()
+    raw_type = schema.get("type")
+    types: set[str] = set()
+    if isinstance(raw_type, str):
+        types.add(raw_type)
+    elif isinstance(raw_type, list):
+        types.update(item for item in raw_type if isinstance(item, str))
+    if "properties" in schema:
+        types.add("object")
+    if "items" in schema:
+        types.add("array")
+    for variant_key in ("anyOf", "oneOf", "allOf"):
+        variants = schema.get(variant_key)
+        if isinstance(variants, list):
+            for variant in variants:
+                types.update(_schema_types(variant))
+    return types
+
+
+def _parse_json_string_for_schema(value: str, *, want_array: bool, want_object: bool) -> tuple[Any, bool]:
+    stripped = value.strip()
+    if not stripped:
+        return value, False
+
+    candidates = [stripped]
+    # Qwen sometimes emits array fields as: {"id":"a"}, {"id":"b"}
+    # Wrap that form only when the schema explicitly asks for an array.
+    if want_array and not stripped.startswith("["):
+        candidates.append(f"[{stripped}]")
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+
+        if want_array:
+            if isinstance(parsed, list):
+                return parsed, True
+            if isinstance(parsed, dict):
+                return [parsed], True
+        if want_object and isinstance(parsed, dict):
+            return parsed, True
+
+    return value, False
+
+
+def _coerce_value_by_schema(tool_name: str, key: str, value: Any, schema: Any) -> Any:
+    if not isinstance(schema, dict):
+        return value
+
+    types = _schema_types(schema)
+    want_array = "array" in types
+    want_object = "object" in types
+
+    if isinstance(value, str) and (want_array or want_object):
+        parsed, changed = _parse_json_string_for_schema(value, want_array=want_array, want_object=want_object)
+        if changed:
+            log.info(
+                "[ToolCoerce] schema decoded JSON string: tool=%s field=%s expected=%s",
+                tool_name,
+                key,
+                ",".join(sorted(types)),
+            )
+            value = parsed
+
+    if want_array:
+        if isinstance(value, dict):
+            value = [value]
+        if isinstance(value, list):
+            item_schema = schema.get("items")
+            if isinstance(item_schema, dict):
+                return [_coerce_value_by_schema(tool_name, f"{key}[]", item, item_schema) for item in value]
+        return value
+
+    if want_object and isinstance(value, dict):
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return value
+        fixed = dict(value)
+        for child_key, child_schema in properties.items():
+            if child_key in fixed:
+                fixed[child_key] = _coerce_value_by_schema(tool_name, f"{key}.{child_key}", fixed[child_key], child_schema)
+        return fixed
+
+    return value
+
+
+def _coerce_tool_input_by_schema(tool_name: str, input_data: dict[str, Any], tools: list[dict[str, Any]]) -> dict[str, Any]:
+    schema = _tool_schema(tool_name, tools)
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict):
+        return input_data
+
+    fixed = dict(input_data)
+    for key, value in list(fixed.items()):
+        property_schema = properties.get(key)
+        if isinstance(property_schema, dict):
+            fixed[key] = _coerce_value_by_schema(tool_name, key, value, property_schema)
+    return fixed
 
 
 def _tool_schema_required(tool_name: str, tools: list[dict[str, Any]]) -> tuple[str, ...]:
@@ -750,9 +878,17 @@ class ToolSieve:
                     self.fence_char = ""
                     self.fence_len = 0
 
-    def _consume_tool_capture(self) -> tuple[str, list, str, bool]:
+    def _consume_tool_capture(self, *, force: bool = False) -> tuple[str, list, str, bool]:
         """尝试解析捕获的工具调用"""
         if not self.capture:
+            return "", [], "", False
+
+        if (
+            not force
+            and re.search(r"function\.name\s*:", self.capture, flags=re.IGNORECASE)
+            and re.search(r"function\.arguments\s*:", self.capture, flags=re.IGNORECASE)
+            and not re.search(r"(?m)\n\s*[\]}]\s*$", self.capture)
+        ):
             return "", [], "", False
 
         # 尝试解析工具调用
@@ -826,7 +962,7 @@ class ToolSieve:
 
         if self.capturing and self.capture:
             # 尝试最后一次解析
-            prefix, calls, suffix, ready = self._consume_tool_capture()
+            prefix, calls, suffix, ready = self._consume_tool_capture(force=True)
             if ready and calls:
                 if prefix:
                     events.append({"type": "content", "text": prefix})

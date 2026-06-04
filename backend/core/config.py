@@ -30,12 +30,14 @@ class Settings(BaseSettings):
     REQUEST_JITTER_MAX_MS: int = int(os.getenv("REQUEST_JITTER_MAX_MS", 0))
     RATE_LIMIT_BASE_COOLDOWN: int = int(os.getenv("RATE_LIMIT_BASE_COOLDOWN", 600))
     RATE_LIMIT_MAX_COOLDOWN: int = int(os.getenv("RATE_LIMIT_MAX_COOLDOWN", 3600))
+    ACCOUNT_READY_SET_THRESHOLD: int = int(os.getenv("ACCOUNT_READY_SET_THRESHOLD", 128))
 
     # 上游 chat 生命周期：默认每次请求结束后删除 Qwen 会话，删除失败有限重试。
     CHAT_DELETE_RETRY_ATTEMPTS: int = int(os.getenv("CHAT_DELETE_RETRY_ATTEMPTS", 3))
     CHAT_DELETE_RETRY_DELAY_SECONDS: float = float(os.getenv("CHAT_DELETE_RETRY_DELAY_SECONDS", 0.5))
     CHAT_ID_PREWARM_TARGET_PER_ACCOUNT: int = int(os.getenv("CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", 5))
     CHAT_ID_PREWARM_TTL_SECONDS: int = int(os.getenv("CHAT_ID_PREWARM_TTL_SECONDS", 120))
+    CHAT_ID_PREWARM_MAX_CONCURRENCY: int = int(os.getenv("CHAT_ID_PREWARM_MAX_CONCURRENCY", 16))
     TRACE_RESPONSE_FINGERPRINTS: bool = os.getenv("TRACE_RESPONSE_FINGERPRINTS", "").strip().lower() in {"1", "true", "yes", "on"}
     TRACE_RESPONSE_TAIL_CHARS: int = int(os.getenv("TRACE_RESPONSE_TAIL_CHARS", 160))
 

@@ -7,7 +7,7 @@ from backend.core.config import settings
 from backend.core.request_logging import update_request_context
 from backend.core.request_trace import find_test_markers, prompt_tail
 from backend.services.auth_resolver import AuthResolver
-from backend.upstream.payload_builder import build_chat_payload
+from backend.upstream.payload_builder import build_chat_payload, normalize_upstream_chat_type
 from backend.upstream.sse_consumer import parse_sse_chunk
 
 log = logging.getLogger("qwen2api.executor")
@@ -68,6 +68,10 @@ class QwenExecutor:
         return set(self._active_chat_ids)
 
     async def _delete_chat_on_close(self, token: str, chat_id: str, *, source: str) -> None:
+        background_delete = getattr(self.engine, "delete_chat_background", None)
+        if background_delete is not None:
+            background_delete(token, chat_id, source=source)
+            return
         delete_fn = getattr(self.engine, "delete_chat_reliable", None)
         if delete_fn is not None:
             await delete_fn(token, chat_id, source=source)
@@ -200,7 +204,7 @@ class QwenExecutor:
                 prompt_len,
                 prompt_tail(content),
             )
-        log.info(f"[上游] 功能配置: thinking_enabled={feature_config.get('thinking_enabled')} auto_thinking={feature_config.get('auto_thinking')} thinking_mode={feature_config.get('thinking_mode')} function_calling={feature_config.get('function_calling')} auto_search={feature_config.get('auto_search')} code_interpreter={feature_config.get('code_interpreter')} plugins_enabled={feature_config.get('plugins_enabled')} image_size={feature_config.get('image_size')} image_ratio={feature_config.get('image_ratio')}")
+        log.info(f"[上游] 功能配置: chat_type={chat_type} thinking_enabled={feature_config.get('thinking_enabled')} auto_thinking={feature_config.get('auto_thinking')} thinking_mode={feature_config.get('thinking_mode')} function_calling={feature_config.get('function_calling')} auto_search={feature_config.get('auto_search')} code_interpreter={feature_config.get('code_interpreter')} plugins_enabled={feature_config.get('plugins_enabled')} default_aspect_ratio={feature_config.get('default_aspect_ratio')} image_size={feature_config.get('image_size')} image_ratio={feature_config.get('image_ratio')}")
 
         prompt_content = payload.get("messages", [{}])[0].get("content", "")
         if has_custom_tools:
@@ -305,7 +309,8 @@ class QwenExecutor:
             meta_yielded = False
             try:
                 log.info(f"[上游] 使用指定账号 账号={acc.email} 模型={model}")
-                chat_id = existing_chat_id or await self.create_chat(acc.token, model, chat_type=chat_type, use_prewarmed=use_prewarmed)
+                create_chat_type = normalize_upstream_chat_type(chat_type)
+                chat_id = existing_chat_id or await self.create_chat(acc.token, model, chat_type=create_chat_type, use_prewarmed=use_prewarmed)
                 self._active_chat_ids.add(chat_id)
                 update_request_context(chat_id=chat_id)
                 if existing_chat_id:
@@ -351,7 +356,8 @@ class QwenExecutor:
             try:
                 log.info(f"[上游] 账号已获取 账号={acc.email} 模型={model} 第{attempt + 1}次 获取耗时={acquire_elapsed:.3f}s")
                 create_start = time.perf_counter()
-                chat_id = await self.create_chat(acc.token, model, chat_type=chat_type, use_prewarmed=use_prewarmed)
+                create_chat_type = normalize_upstream_chat_type(chat_type)
+                chat_id = await self.create_chat(acc.token, model, chat_type=create_chat_type, use_prewarmed=use_prewarmed)
                 self._active_chat_ids.add(chat_id)
                 create_elapsed = time.perf_counter() - create_start
                 update_request_context(chat_id=chat_id)

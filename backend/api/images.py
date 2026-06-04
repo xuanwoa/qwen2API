@@ -136,9 +136,14 @@ def _extract_upstream_failure(text: str) -> str | None:
 
 
 def _resolve_image_model(requested: str | None) -> str:
+    from backend.core.config import resolve_model
+    from backend.services.model_modes import parse_model_mode
+
     if not requested:
         return DEFAULT_IMAGE_MODEL
-    return IMAGE_MODEL_MAP.get(requested, DEFAULT_IMAGE_MODEL)
+    aliased = IMAGE_MODEL_MAP.get(str(requested).strip(), str(requested).strip())
+    mode = parse_model_mode(aliased, default_model=DEFAULT_IMAGE_MODEL)
+    return resolve_model(mode.base_model or DEFAULT_IMAGE_MODEL)
 
 
 def _normalize_image_size(value: str | None) -> tuple[str, str, int, int]:
@@ -265,4 +270,4 @@ async def create_image(request: Request):
         if acc is not None:
             client.account_pool.release(acc)
             if chat_id:
-                await client.delete_chat_reliable(acc.token, chat_id, source="image_cleanup")
+                client.delete_chat_background(acc.token, chat_id, source="image_cleanup")

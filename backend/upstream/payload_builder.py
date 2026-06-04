@@ -22,6 +22,8 @@ CUSTOM_TOOL_LOW_LATENCY_OVERRIDES = {
 
 IMAGE_CHAT_TYPES = {"image_gen", "t2i"}
 VIDEO_CHAT_TYPES = {"t2v"}
+UPSTREAM_IMAGE_CHAT_TYPE = "t2i"
+UPSTREAM_VIDEO_CHAT_TYPE = "t2v"
 
 
 def _apply_thinking_config(feature_config: dict, enabled: bool) -> None:
@@ -32,6 +34,47 @@ def _apply_thinking_config(feature_config: dict, enabled: bool) -> None:
             "thinking_mode": "Auto" if enabled else "Disabled",
         }
     )
+
+
+def normalize_upstream_chat_type(chat_type: str) -> str:
+    return UPSTREAM_IMAGE_CHAT_TYPE if chat_type in IMAGE_CHAT_TYPES else chat_type
+
+
+def _image_ratio(image_options: dict) -> str:
+    ratio = image_options.get("ratio") or image_options.get("aspect_ratio") or image_options.get("aspectRatio")
+    return str(ratio or "1:1")
+
+
+def _build_image_feature_config(image_options: dict) -> dict:
+    ratio = _image_ratio(image_options)
+    return {
+        "thinking_enabled": False,
+        "output_schema": "phase",
+        "auto_thinking": False,
+        "thinking_mode": "off",
+        "auto_search": False,
+        "code_interpreter": False,
+        "function_calling": False,
+        "plugins_enabled": True,
+        "image_generation": True,
+        "default_aspect_ratio": ratio,
+    }
+
+
+def _build_video_feature_config(video_options: dict) -> dict:
+    ratio = _image_ratio(video_options)
+    return {
+        "thinking_enabled": False,
+        "output_schema": "phase",
+        "auto_thinking": False,
+        "thinking_mode": "off",
+        "auto_search": False,
+        "code_interpreter": False,
+        "function_calling": False,
+        "plugins_enabled": True,
+        "video_generation": True,
+        "default_aspect_ratio": ratio,
+    }
 
 
 def build_chat_payload(
@@ -49,53 +92,49 @@ def build_chat_payload(
     is_image_gen = chat_type in IMAGE_CHAT_TYPES
     is_video_gen = chat_type in VIDEO_CHAT_TYPES
     image_options = image_options or {}
-    feature_config = {
-        **CUSTOM_TOOL_COMPAT_FEATURE_CONFIG,
-        **(CUSTOM_TOOL_LOW_LATENCY_OVERRIDES if has_custom_tools else {}),
-        # Our Anthropic/OpenAI bridge relies on textual JSON/XML tool directives
-        # that are parsed locally. Enabling Qwen native function_calling here causes
-        # upstream interception such as `Tool Read/Bash does not exists.` for custom
-        # local tools that only exist in the bridge layer.
-        "function_calling": False,
-        # Additional safeguards to prevent tool call interception
-        "enable_tools": False,
-        "enable_function_call": False,
-        "tool_choice": "none",
-        "auto_search": bool(enable_search or chat_type == "deep_research"),
-        "plugins_enabled": is_image_gen,
-        "image_gen": is_image_gen,
-        "image_generation": is_image_gen,
-    }
-    if thinking_enabled is not None:
-        _apply_thinking_config(feature_config, bool(thinking_enabled))
-    if is_image_gen or is_video_gen:
-        _apply_thinking_config(feature_config, False)
     if is_image_gen:
-        feature_config.update(
-            {
-                "image_size": image_options.get("size"),
-                "image_ratio": image_options.get("ratio"),
-                "aspect_ratio": image_options.get("ratio"),
-                "width": image_options.get("width"),
-                "height": image_options.get("height"),
-            }
-        )
-        feature_config = {k: v for k, v in feature_config.items() if v is not None}
+        feature_config = _build_image_feature_config(image_options)
+        message_chat_type = "t2t"
+        sub_chat_type = UPSTREAM_IMAGE_CHAT_TYPE
+        message_extra_meta = {
+            "subChatType": UPSTREAM_IMAGE_CHAT_TYPE,
+            "mode": "image_generation",
+            "aspectRatio": _image_ratio(image_options),
+            "size": _image_ratio(image_options),
+        }
+    elif is_video_gen:
+        feature_config = _build_video_feature_config(image_options)
+        message_chat_type = UPSTREAM_VIDEO_CHAT_TYPE
+        sub_chat_type = UPSTREAM_VIDEO_CHAT_TYPE
+        message_extra_meta = {
+            "subChatType": UPSTREAM_VIDEO_CHAT_TYPE,
+            "mode": "video_generation",
+            "aspectRatio": _image_ratio(image_options),
+            "size": _image_ratio(image_options),
+        }
+    else:
+        feature_config = {
+            **CUSTOM_TOOL_COMPAT_FEATURE_CONFIG,
+            **(CUSTOM_TOOL_LOW_LATENCY_OVERRIDES if has_custom_tools else {}),
+            # Our Anthropic/OpenAI bridge relies on textual JSON/XML tool directives
+            # that are parsed locally. Enabling Qwen native function_calling here causes
+            # upstream interception such as `Tool Read/Bash does not exists.` for custom
+            # local tools that only exist in the bridge layer.
+            "function_calling": False,
+            # Additional safeguards to prevent tool call interception
+            "enable_tools": False,
+            "enable_function_call": False,
+            "tool_choice": "none",
+            "auto_search": bool(enable_search or chat_type == "deep_research"),
+            "plugins_enabled": False,
+        }
+        if thinking_enabled is not None:
+            _apply_thinking_config(feature_config, bool(thinking_enabled))
+        message_chat_type = chat_type
+        sub_chat_type = chat_type
+        message_extra_meta = {"subChatType": chat_type}
 
-    message_extra_meta = {"subChatType": chat_type}
-    if is_image_gen:
-        message_extra_meta.update(
-            {
-                "imageSize": image_options.get("size"),
-                "imageRatio": image_options.get("ratio"),
-                "aspectRatio": image_options.get("ratio"),
-                "width": image_options.get("width"),
-                "height": image_options.get("height"),
-            }
-        )
-        message_extra_meta = {k: v for k, v in message_extra_meta.items() if v is not None}
-
-    return {
+    payload = {
         "stream": True,
         "version": "2.1",
         "incremental_output": True,
@@ -114,13 +153,15 @@ def build_chat_payload(
                 "files": files or [],
                 "timestamp": ts,
                 "models": [model],
-                "chat_type": chat_type,
+                "chat_type": message_chat_type,
                 "feature_config": feature_config,
                 "extra": {"meta": message_extra_meta},
-                "sub_chat_type": chat_type,
+                "sub_chat_type": sub_chat_type,
                 "parent_id": None,
             }
         ],
         "timestamp": ts,
-        **({"image_options": image_options} if is_image_gen and image_options else {}),
     }
+    if is_image_gen or is_video_gen:
+        payload["size"] = _image_ratio(image_options)
+    return payload
